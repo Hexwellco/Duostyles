@@ -1,0 +1,5808 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const FUNCTION_VERSION = "generate-v3-async-openai";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+};
+
+type GenerateResponse = {
+  provider: "openai" | "replicate";
+  status: "processing" | "succeeded" | "failed";
+  predictionId?: string;
+  output?: string;
+  error?: string;
+  model?: string;
+  referenceId?: string;
+  functionVersion?: string;
+};
+
+function jsonResponse(body: GenerateResponse | Record<string, unknown>, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+const REPLICATE_DEFAULT_MODEL = "google/nano-banana-pro";
+
+// ── Universal prompt (used for styles with locked: false) ──
+const UNIVERSAL_PROMPT = `Use the reference image as a composition and scene template.
+
+Erase all original people from the scene. Their positions are empty slots — fill them with the people from the uploaded identity photos.
+
+CHARACTER REPLACEMENT:
+— woman in the scene → woman from the uploaded female photo
+— man in the scene → man from the uploaded male photo
+Gender must match exactly. Do NOT swap roles.
+
+PLACEMENT:
+Place each new person into the exact spatial position of the original:
+— same location, scale, depth, and perspective.
+
+FULL RECONSTRUCTION:
+Rebuild each person entirely from their identity image — face, body, proportions, silhouette.
+Do NOT face-swap. Do NOT blend with original characters.
+
+IDENTITY:
+Preserve from uploaded photos: facial structure, features, skin tone, hair, proportions.
+Identity must remain clearly recognizable.
+
+CLOTHING:
+Adapt clothing naturally to the scene — match the style and environment, avoid mismatched outfits.
+
+POSE & COMPOSITION:
+Preserve camera angle, pose structure, body orientation, spacing, framing.
+Match pose and placement, NOT original anatomy.
+
+LIGHTING & INTEGRATION:
+Fully integrate into the scene — match lighting direction, shadows, color grading, depth of field, grain.
+Faces and bodies must inherit scene lighting. Result must not look pasted or composited.`;
+
+// ── Per-style prompt constants ──
+
+const ZOOTOPIA_1 = `Replace the fox (left) with the uploaded man and the rabbit (right) with the uploaded woman. Recreate them as stylized Pixar/Disney 3D CGI human characters — fully reconstructed, not face-swapped.
+
+IDENTITY:
+Faces must be highly recognizable: facial proportions, bone structure, eye shape, nose, lips, jawline, skin tone, hairstyle and color.
+
+POSE (ABSOLUTE):
+— both characters cheek-to-cheek, heads slightly tilted inward
+— woman (right) holds camera at arm's length
+— tight selfie framing, both looking directly into the camera
+Do NOT change angle, framing, or head tilt.
+
+EXPRESSION: man — relaxed half-smile. Woman — soft friendly smile.
+
+STYLE: Full Pixar/Disney 3D — soft shading, clean skin, expressive eyes. Plain neutral background, unchanged.
+
+HANDS: Human, anatomically correct, exactly five fingers, correct selfie grip perspective.`;
+
+const ZOOTOPIA_2 = `Replace the fox (left) with the uploaded man and the rabbit (right) with the uploaded woman. Recreate both as fully human Pixar/Disney-style 3D CGI characters while preserving the exact composition, pose, lighting, and cinematic atmosphere of the original selfie scene.
+
+PRIORITY:
+
+Exact identity preservation from uploaded photos
+Original selfie pose and composition
+Accurate scene lighting and environment
+High-end Pixar/Disney cinematic rendering
+
+IDENTITY (MAXIMUM ACCURACY):
+Faces must remain extremely recognizable from the uploaded photos with very high identity fidelity.
+
+Precisely preserve:
+— exact eye color with matching hue, saturation, and brightness
+— iris details, limbal ring, and pupil proportions
+— eye shape, eyelid shape, eye spacing, and gaze direction
+— eyebrow shape, thickness, density, and positioning
+— nose bridge, nose width, nostril shape, and tip structure
+— lip contour, lip volume, cupid’s bow, and smile lines
+— jawline, cheekbones, chin shape, and facial proportions
+— forehead proportions and face silhouette
+— skin tone, undertone, and natural complexion
+— hairstyle, hairline, hair texture, hair density, color, and length
+— facial asymmetry and all unique identifying traits
+
+Do NOT:
+— change eye color
+— beautify or idealize faces
+— genericize features
+— mix identities
+— alter ethnicity or age appearance
+
+Avoid generic Pixar faces. The characters must clearly look like the uploaded people while rendered in Pixar/Disney CGI style.
+
+POSE (ABSOLUTE):
+— preserve the exact selfie composition from the reference image
+— woman (right) closest to camera in foreground
+— man (left) positioned slightly behind her shoulder
+— woman extends arm toward camera holding phone in selfie position
+— preserve exact head tilt, shoulder angles, spacing, and body orientation
+— both characters looking directly into camera
+— preserve original lens perspective and framing exactly
+
+Do NOT:
+— change camera angle
+— reposition characters
+— alter framing
+— change distance between subjects
+— modify perspective
+
+EXPRESSION:
+Man — relaxed confident smirk with subtle playful attitude.
+Woman — cheerful playful smile with bright expressive eyes.
+
+BODY:
+Both characters must be fully human adults with realistic anatomy and proportions.
+
+Remove ALL animal anatomy completely:
+— no fur
+— no rabbit ears
+— no fox ears
+— no tails
+— no whiskers
+— no paws
+— no claws
+— no animal body structure
+
+Arms, shoulders, neck, hands, and facial anatomy must be fully human and physically correct.
+
+STYLE:
+Ultra high-end Pixar/Disney cinematic 3D CGI render:
+— realistic stylized human faces
+— expressive animated-film eyes
+— soft cinematic skin shading
+— detailed realistic hair grooming
+— subtle subsurface scattering
+— film-quality rendering
+— polished Disney/Pixar visual fidelity
+— soft global illumination
+— cinematic depth of field
+— realistic material response
+
+LIGHTING:
+Preserve the original futuristic neon city lighting exactly:
+— pink, cyan, orange, and purple neon reflections
+— billboard light spill
+— soft ambient glow
+— cinematic contrast
+— realistic reflected light on skin and clothing
+— soft bloom and atmospheric haze
+— natural shadow direction matching original scene
+
+Faces and skin must fully inherit environmental lighting and color reflections naturally.
+
+SCENE:
+Keep the futuristic Zootopia-style city environment unchanged:
+— same billboards
+— same architecture
+— same background composition
+— same atmosphere
+— same depth and blur
+— same cinematic framing
+
+Only replace the two characters.
+
+HANDS:
+Human hands only with anatomically correct structure.
+Exactly five fingers on each hand.
+Correct joint placement and finger proportions.
+Natural selfie-camera grip and realistic perspective.
+No finger deformation, duplication, fusion, extra fingers, missing fingers, or cartoon paw anatomy.`;
+
+const ZOOTOPIA_3 = `Replace the fox (left) with the uploaded man and the rabbit (right) with the uploaded woman as fully human Pixar-style 3D CGI characters integrated into the scene.
+
+PRIORITY: 1) Identity from uploaded photos  2) Original pose and composition  3) Lighting and style
+
+IDENTITY:
+Preserve with high accuracy: facial structure, eye shape, nose, lips, jawline, skin tone, hairstyle, hair color and length. Do NOT genericize or mix identities.
+
+BODY:
+Both characters must be fully human with realistic adult anatomy. The fox and rabbit are pose references only — remove all animal features (paws, fur, tails, ears, claws). Woman must have full realistic adult proportions, not shortened or compressed. Man must have two fully human arms and hands with exactly five fingers each. No animal anatomy anywhere.
+
+POSE:
+Man — raised arm holding phone in selfie position, slight head tilt, relaxed confident posture.
+Woman — naturally close to the man, slight lean toward him.
+Preserve selfie composition, camera angle, framing, depth. Do NOT change perspective.
+
+EXPRESSION: Man — confident playful smirk. Woman — cheerful, slightly mischievous smile.
+
+LIGHTING: Colorful nightclub lighting — magenta, purple, blue tones, mixed ambient sources, color reflections on skin. Match light direction, atmosphere, cinematic contrast, depth of field, film grain. Faces fully inherit scene lighting.
+
+SCENE: Do NOT change environment, background characters, or composition. Only replace characters.
+
+HANDS: Exactly five fingers, correct anatomy, natural placement. Man holds smartphone in proper selfie grip.`;
+
+const TANGLED_1 = `Use the reference image as a composition, pose, and stylized 3D animation template.
+
+Remove the original characters completely and recreate them using the uploaded reference people.
+
+CHARACTERS:
+— left character → exact appearance of the man from the uploaded male photo
+— right character → exact appearance of the woman from the uploaded female photo
+
+Preserve their real appearance as accurately as possible:
+— facial structure
+— hairstyle
+— hair color
+— skin tone
+— clothing style
+— recognizable proportions
+— overall likeness
+
+IMPORTANT:
+Do NOT create generic animated characters.
+
+The reconstructed characters must clearly and immediately resemble the uploaded people while being converted into stylized cinematic 3D animated characters.
+
+Do NOT:
+— paste faces onto existing characters
+— keep original heads or anatomy
+— blend original characters with the new people
+— create face-swap artifacts
+— generate random hairstyles or clothing
+
+FULL CHARACTER RECONSTRUCTION:
+Rebuild each person entirely:
+— full body
+— face
+— head shape
+— hairstyle
+— clothing
+— silhouette
+— posture
+— body anatomy
+— hands and proportions
+
+The original characters must be completely removed.
+
+CLOTHING:
+Transfer and adapt the uploaded people’s clothing into the fantasy animated world while preserving:
+— recognizable outfit colors
+— clothing shapes
+— layered clothing details
+— overall fashion identity
+
+Clothing should feel naturally stylized for a cinematic fantasy animation but still clearly belong to the uploaded people.
+
+STYLE:
+High-quality stylized 3D animated movie aesthetic:
+— cinematic rendering
+— expressive stylized eyes
+— soft skin shading
+— realistic animated hair
+— stylized but believable anatomy
+— polished animated-film quality
+— warm fantasy atmosphere
+
+INTERACTION:
+Preserve:
+— eye contact
+— embrace
+— emotional connection
+— body orientation
+— hand placement
+
+The two reconstructed characters must naturally look at each other and feel emotionally connected.
+
+POSE & COMPOSITION:
+Keep:
+— camera angle
+— framing
+— spacing
+— composition
+— pose structure
+
+Match pose placement only — not original anatomy.
+
+SCENE:
+Preserve:
+— floating lanterns
+— fantasy castle background
+— water reflections
+— nighttime magical atmosphere
+— warm cinematic lighting
+
+LIGHTING:
+Match:
+— glowing lantern illumination
+— soft cinematic shadows
+— atmospheric depth
+— warm reflections
+— cinematic color grading
+
+Faces, hair, skin, and clothing must inherit the exact lighting and mood of the environment.
+
+The final result should look like a genuine stylized animated movie frame featuring recognizable animated versions of the uploaded people fully integrated into the fantasy scene — not a face swap or edited original image.`;
+
+const TANGLED_2 = `Use the reference image as a composition, interaction, and stylized 3D animation template.
+
+Preserve the cinematic fantasy atmosphere and the stylized animated movie aesthetic of the original scene.
+
+Remove the original characters completely and recreate them using the uploaded reference people.
+
+CHARACTERS:
+— male character sitting on the left → exact appearance of the man from the uploaded male photo
+— female character sitting on the right → exact appearance of the woman from the uploaded female photo
+
+Preserve their recognizable real appearance as accurately as possible:
+— facial structure
+— hairstyle
+— hair color
+— skin tone
+— clothing identity
+— body proportions
+— overall likeness
+
+IMPORTANT:
+Do NOT create generic animated characters.
+
+The reconstructed characters must clearly resemble the uploaded people while being transformed into stylized cinematic 3D animated characters.
+
+Do NOT:
+— paste faces onto existing characters
+— keep original heads or anatomy
+— blend original characters with the uploaded people
+— create face-swap artifacts
+— morph faces onto existing bodies
+— generate random hairstyles or clothing
+
+FULL CHARACTER RECONSTRUCTION:
+Rebuild each person completely:
+— full body
+— face
+— head shape
+— hairstyle
+— hands
+— posture
+— body anatomy
+— proportions
+— silhouette
+— clothing adaptation
+
+The original characters must be fully removed and replaced.
+
+INTERACTION & EXPRESSIONS:
+Preserve:
+— eye contact
+— emotional connection
+— subtle smiling expressions
+— relaxed body language
+— seated interaction
+— natural attention toward each other
+
+The two reconstructed characters must feel naturally present together in the same animated world.
+
+POSE & COMPOSITION:
+Preserve:
+— sitting positions
+— body orientation
+— camera angle
+— framing
+— spacing between characters
+— composition balance
+— hand placement
+— gaze direction
+
+Match pose placement only — not original anatomy.
+
+CLOTHING:
+Adapt the uploaded people’s clothing into the fantasy animated world while preserving:
+— recognizable outfit colors
+— clothing style
+— layered outfit details
+— overall fashion identity
+
+Clothing should feel naturally stylized for a cinematic fantasy animation while still clearly belonging to the uploaded people.
+
+STYLE:
+High-quality stylized cinematic 3D animated movie aesthetic:
+— expressive stylized eyes
+— soft cinematic skin shading
+— realistic animated hair
+— stylized but believable anatomy
+— cinematic rendering
+— polished animated-film quality
+— warm fantasy atmosphere
+
+The result should look like a frame from a modern animated fantasy movie.
+
+SCENE PRESERVATION:
+Keep unchanged:
+— nighttime forest environment
+— warm fire/campfire lighting
+— dark blue atmosphere
+— cinematic shadows
+— fantasy environment
+— overall composition
+
+LIGHTING & INTEGRATION:
+Fully integrate the reconstructed animated characters into the environment:
+— warm orange fire lighting
+— soft shadows
+— glowing skin reflections
+— cinematic depth
+— atmospheric shading
+— warm/cool color contrast
+— stylized animated rendering
+
+Faces, hair, skin, and clothing must inherit the exact lighting and atmosphere of the environment.
+
+The final result should look like a genuine stylized animated movie frame featuring recognizable animated versions of the uploaded people naturally integrated into the fantasy scene — not a face swap, pasted composite, or edited original image.`;
+
+const TANGLED_3 = `Use the reference image as a composition, interaction, and stylized 3D animation template.
+
+Preserve the cinematic fantasy atmosphere and the stylized animated movie aesthetic of the original scene.
+
+Remove the original characters completely and recreate them using the uploaded reference people.
+
+CHARACTERS:
+— male character on the left holding the crown → exact appearance of the man from the uploaded male photo
+— female character on the right receiving the crown → exact appearance of the woman from the uploaded female photo
+
+Preserve their recognizable real appearance as accurately as possible:
+— facial structure
+— hairstyle
+— hair color
+— skin tone
+— clothing identity
+— body proportions
+— overall likeness
+
+IMPORTANT:
+Do NOT create generic animated characters.
+
+The reconstructed characters must clearly resemble the uploaded people while being transformed into stylized cinematic 3D animated characters.
+
+Do NOT:
+— paste faces onto existing characters
+— keep original heads or anatomy
+— blend original characters with the uploaded people
+— create face-swap artifacts
+— morph faces onto existing bodies
+— generate random hairstyles or clothing
+
+FULL CHARACTER RECONSTRUCTION:
+Rebuild each person completely:
+— full body
+— face
+— head shape
+— hairstyle
+— hands
+— posture
+— body anatomy
+— proportions
+— silhouette
+— clothing adaptation
+
+The original characters must be fully removed and replaced.
+
+INTERACTION & EXPRESSIONS:
+Preserve:
+— eye contact
+— playful emotional connection
+— subtle smiling expressions
+— elegant body language
+— crown exchange interaction
+— natural attention toward each other
+— hand positioning
+— romantic fantasy interaction
+
+The two reconstructed characters must feel naturally present together in the same animated world.
+
+POSE & COMPOSITION:
+Preserve:
+— male bowing posture
+— female receiving gesture
+— body orientation
+— camera angle
+— framing
+— spacing between characters
+— composition balance
+— crown positioning
+— gaze direction
+— arm and hand placement
+
+Match pose placement only — not original anatomy.
+
+CLOTHING:
+Adapt the uploaded people’s clothing into the fantasy royal animated world while preserving:
+— recognizable outfit colors
+— clothing style
+— layered outfit details
+— overall fashion identity
+
+Clothing should feel naturally stylized for a cinematic fantasy animation while still clearly belonging to the uploaded people.
+
+STYLE:
+High-quality stylized cinematic 3D animated movie aesthetic:
+— expressive stylized eyes
+— soft cinematic skin shading
+— realistic animated hair
+— stylized but believable anatomy
+— cinematic rendering
+— polished animated-film quality
+— warm fantasy atmosphere
+
+The result should look like a frame from a modern animated fantasy movie.
+
+SCENE PRESERVATION:
+Keep unchanged:
+— royal courtyard
+— palace architecture
+— crowd in the background
+— festive decorations
+— fantasy environment
+— overall composition
+— cinematic atmosphere
+
+LIGHTING & INTEGRATION:
+Fully integrate the reconstructed animated characters into the environment:
+— warm cinematic daylight lighting
+— soft shadows
+— glowing skin reflections
+— cinematic depth
+— atmospheric shading
+— warm fantasy color grading
+— stylized animated rendering
+
+Faces, hair, skin, and clothing must inherit the exact lighting and atmosphere of the environment.
+
+The final result should look like a genuine stylized animated movie frame featuring recognizable animated versions of the uploaded people naturally integrated into the fantasy royal scene — not a face swap, pasted composite, or edited original image.`;
+
+const CINDERELLA_1 = `Use the original scene image as the base.
+
+PRIMARY TASK:
+Replace both character identities using the reference photos.
+
+CHARACTER MAPPING:
+- female → woman from female reference
+- male → man from male reference
+
+PRIORITY ORDER:
+1. Identity replacement (highest priority)
+2. Pose, body position, head angle, visibility, interaction
+3. Scene, lighting, camera, background, clothing, style
+
+IDENTITY RULES:
+Completely remove the original identities.
+Use only the reference identities.
+Do NOT mix original and new identity.
+Do NOT keep any original facial features, hair identity, or recognizable traits.
+
+Perform full character replacement, not face swapping.
+
+SCENE PRESERVATION:
+Keep unchanged:
+- pose and body alignment
+- head angle and face direction
+- camera, framing, perspective
+- lighting, shadows, color grading
+- background and all objects
+- clothing and accessories
+
+Recreate each person naturally in the same position, adapting identity to fit perspective, lighting, and body.
+
+IDENTITY ACCURACY:
+Preserve:
+- facial structure and proportions
+- skin tone and texture
+- eyes, nose, lips, bone structure
+- hair shape, color, length
+Keep the person clearly recognizable.
+
+Do not paste or overlay faces.
+Ensure seamless head–body integration.
+
+STYLE ADAPTATION:
+Match the original style:
+- animated → same stylized/cartoon form
+- realistic → photorealistic detail
+Do not over-stylize.
+
+HEAD ANGLE & VISIBILITY:
+Keep original head angle, direction, and visibility.
+No rotation, no frontalization.
+Do not reveal hidden faces.
+Respect gaze direction and perspective.
+
+ANATOMY:
+Preserve body anatomy.
+Hands: 5 fingers, correct proportions, no distortion.
+
+Respect occlusions (hair, objects, motion blur).
+Do not generate hidden parts.
+
+QUALITY:
+High-resolution, sharp, natural skin texture, correct lighting.
+
+OUTPUT:
+Same scene, same composition — only identities replaced.`;
+
+const CINDERELLA_2 = `Use the original scene image as the base.
+
+PRIMARY TASK:
+Replace both character identities using the reference photos.
+
+CHARACTER MAPPING:
+- female → woman from female reference
+- male → man from male reference
+
+PRIORITY ORDER:
+1. Identity replacement (highest priority)
+2. Pose, body position, head angle, visibility, interaction
+3. Scene, lighting, camera, background, clothing, style
+
+IDENTITY RULES:
+Completely remove the original identities.
+Use only the reference identities.
+Do NOT mix original and new identity.
+Do NOT keep any original facial features, hair identity, or recognizable traits.
+
+Perform full character replacement, not face swapping.
+
+SCENE PRESERVATION:
+Keep unchanged:
+- pose and body alignment
+- head angle and face direction
+- camera, framing, perspective
+- lighting, shadows, color grading
+- background and all objects
+- clothing and accessories
+
+Recreate each person naturally in the same position, adapting identity to fit perspective, lighting, and body.
+
+IDENTITY ACCURACY:
+Preserve:
+- facial structure and proportions
+- skin tone and texture
+- eyes, nose, lips, bone structure
+- hair shape, color, length
+Keep the person clearly recognizable.
+
+Do not paste or overlay faces.
+Ensure seamless head–body integration.
+
+STYLE ADAPTATION:
+Match the original style:
+- animated → same stylized/cartoon form
+- realistic → photorealistic detail
+Do not over-stylize.
+
+HEAD ANGLE & VISIBILITY:
+Keep original head angle, direction, and visibility.
+No rotation, no frontalization.
+Do not reveal hidden faces.
+Respect gaze direction and perspective.
+
+ANATOMY:
+Preserve body anatomy.
+Hands: 5 fingers, correct proportions, no distortion.
+
+Respect occlusions (hair, objects, motion blur).
+Do not generate hidden parts.
+
+QUALITY:
+High-resolution, sharp, natural skin texture, correct lighting.
+
+OUTPUT:
+Same scene, same composition — only identities replaced.`;
+
+const CINDERELLA_3 = `Use the original scene image as the base.
+
+PRIMARY TASK:
+Replace both character identities using the reference photos.
+
+CHARACTER MAPPING:
+- female → woman from female reference
+- male → man from male reference
+
+PRIORITY ORDER:
+1. Identity replacement (highest priority)
+2. Pose, body position, head angle, visibility, interaction
+3. Scene, lighting, camera, background, clothing, style
+
+IDENTITY RULES:
+Completely remove the original identities.
+Use only the reference identities.
+Do NOT mix original and new identity.
+Do NOT keep any original facial features, hair identity, or recognizable traits.
+
+Perform full character replacement, not face swapping.
+
+SCENE PRESERVATION:
+Keep unchanged:
+- pose and body alignment
+- head angle and face direction
+- camera, framing, perspective
+- lighting, shadows, color grading
+- background and all objects
+- clothing and accessories
+
+Recreate each person naturally in the same position, adapting identity to fit perspective, lighting, and body.
+
+IDENTITY ACCURACY:
+Preserve:
+- facial structure and proportions
+- skin tone and texture
+- eyes, nose, lips, bone structure
+- hair shape, color, length
+Keep the person clearly recognizable.
+
+Do not paste or overlay faces.
+Ensure seamless head–body integration.
+
+STYLE ADAPTATION:
+Match the original style:
+- animated → same stylized/cartoon form
+- realistic → photorealistic detail
+Do not over-stylize.
+
+HEAD ANGLE & VISIBILITY:
+Keep original head angle, direction, and visibility.
+No rotation, no frontalization.
+Do not reveal hidden faces.
+Respect gaze direction and perspective.
+
+ANATOMY:
+Preserve body anatomy.
+Hands: 5 fingers, correct proportions, no distortion.
+
+Respect occlusions (hair, objects, motion blur).
+Do not generate hidden parts.
+
+QUALITY:
+High-resolution, sharp, natural skin texture, correct lighting.
+
+OUTPUT:
+Same scene, same composition — only identities replaced.`;
+
+const EUPHORIA_1 = `Replace the two people in the original hallway image with the people from the provided reference photos.
+
+Left side:
+Use the girl from the reference image. Preserve her exact facial features, hairstyle, hair color, skin tone, body proportions, expression, clothing, accessories, and overall appearance.
+
+Right side:
+Use the boy from the reference image. Preserve his exact facial features, hairstyle, hair texture, skin tone, body proportions, expression, clothing, and overall appearance.
+
+Keep the original hallway environment unchanged:
+school corridor, lockers, background students, cinematic composition, camera angle, lighting, depth of field, shadows, and realistic atmosphere.
+
+The new people must naturally match the original poses and positions from the base image. Maintain realistic anatomy, realistic skin texture, photorealistic details, natural lighting, accurate proportions, and seamless blending into the scene.
+
+High detail, ultra realistic photo, cinematic photography, shallow depth of field, natural colors, realistic shadows, no filters.
+
+All characters are adults over 18 years old.
+
+Negative prompt:
+cartoon, anime, illustration, painting, CGI, 3d render, fake skin, blurry face, distorted anatomy, extra fingers, bad hands, low quality, overexposed, oversaturated, watermark, text, logo, duplicate person, deformed face, unrealistic proportions`;
+
+const EUPHORIA_2 = `Use the reference image ONLY for:
+
+exact composition
+exact body positioning
+exact head tilt
+exact torso rotation
+exact shoulder angle
+exact couch placement
+exact eye-line direction
+exact framing
+exact camera angle
+exact perspective
+exact lighting
+exact depth of field
+exact cinematic atmosphere
+
+Completely remove the original man and woman from the reference scene.
+
+Replace them with TWO entirely new people using ONLY the uploaded male and uploaded female as identity references.
+
+CRITICAL PRIORITY:
+Identity preservation and pose accuracy are MORE IMPORTANT than cinematic stylization.
+
+The generated people must look almost identical to the uploaded references and must keep their real-world appearance.
+
+Do NOT:
+
+beautify
+stylize
+reinterpret
+age up/down
+sharpen features
+glamorize
+change proportions
+make them look like actors/models
+
+Preserve EXACTLY:
+
+facial bone structure
+eye shape
+eye spacing
+eyelids
+eyebrows
+nose shape
+lips
+jawline
+cheekbones
+chin
+hairline
+hairstyle
+hair density
+hair texture
+skin tone
+facial proportions
+body proportions
+silhouette
+age appearance
+
+DO NOT inherit ANY facial or body traits from the original people in the cinematic reference image.
+
+The uploaded people must fully replace the original subjects across the ENTIRE body.
+
+Replacement mapping:
+
+uploaded male → left person on couch
+uploaded female → right person facing him
+
+POSE ACCURACY IS CRITICAL:
+
+The uploaded male must replicate the original male pose EXACTLY:
+
+same leaning angle into the couch
+same neck bend
+same head tilt
+same eye direction toward the girl
+same shoulder posture
+same torso orientation
+same relaxed body language
+same distance from camera
+same crop framing
+same arm placement perspective
+same seated depth into the couch
+
+The uploaded female must replicate the original female pose EXACTLY:
+
+same partial side-profile visibility
+same shoulder angle
+same head positioning
+same seated orientation
+same proximity to the male
+same framing crop
+same eye-line interaction
+
+The final result must feel like the uploaded people were naturally photographed in the original cinematic scene.
+
+NO face swap look.
+NO morphing.
+NO blended identities.
+NO partial replacement.
+
+Generate:
+
+complete realistic anatomy
+coherent neck attachment
+natural shoulders
+realistic arms
+realistic hands
+accurate body mass
+natural posture
+believable clothing folds
+
+Lighting must perfectly match the environment:
+
+warm cinematic indoor lighting
+soft practical lamp glow
+realistic skin shading
+subtle shadow falloff
+shallow depth of field
+realistic environmental reflections
+slight film grain
+
+Preserve:
+
+couch texture
+room composition
+background blur
+environmental depth
+warm cinematic grading
+
+The image must look like a real in-camera cinematic photograph, not AI-generated or composited.
+
+Strictly avoid:
+
+pose drift
+identity drift
+generic faces
+beautification
+plastic skin
+anatomy distortion
+warped hands
+incorrect perspective
+incorrect body angle
+inconsistent lighting
+remnants of original people
+face swap artifacts
+altered facial structure
+exaggerated emotions`;
+
+const EUPHORIA_3 = `Use the reference scene ONLY for:
+— composition
+— framing
+— lens perspective
+— camera angle
+— blocking
+— pose logic
+— emotional interaction
+— lighting direction
+
+Completely remove the original actors.
+
+Rebuild both characters entirely from the uploaded identity photos.
+
+DO NOT:
+— face swap
+— morph with original actors
+— average faces
+— stylize
+— beautify
+— reinterpret anatomy
+— generate “similar-looking” people
+
+IDENTITY TRANSFER PRIORITY:
+The final result must preserve the uploaded people with near-photographic identity accuracy.
+
+For BOTH characters preserve exactly:
+— facial bone structure
+— eye shape, size, spacing, and eyelids
+— nose bridge, nostrils, and tip anatomy
+— lip contour and natural asymmetry
+— jawline geometry
+— cheek volume
+— forehead proportions
+— chin shape
+— ear placement
+— skin tone and undertones
+— hair density
+— hairline shape
+— hairstyle texture
+— neck thickness and proportions
+— body proportions
+— apparent age
+
+The generated people must look unmistakably identical to the uploaded photos under cinematic lighting conditions.
+
+CRITICAL:
+Identity consistency is more important than cinematic stylization.
+
+Use the uploaded photos as the ONLY source of facial identity and anatomy.
+
+Do not inherit:
+— facial proportions
+— facial lighting
+— skin texture
+— eye shape
+— expressions
+from the original actors.
+
+EXPRESSION TRANSFER:
+Recreate ONLY the emotional behavior from the reference scene:
+— same eye direction
+— same conversational focus
+— same subtle smirk intensity
+— same eyelid openness
+— same eyebrow tension
+— same relaxed intimacy
+— same natural mouth tension
+
+Expressions must feel candid and unposed.
+
+BODY & POSE:
+Preserve:
+— exact body positioning
+— distance between characters
+— head tilt
+— shoulder angles
+— arm placement
+— torso orientation
+— framing on the bed
+
+But rebuild anatomy using ONLY the uploaded people.
+
+CLOTHING:
+Use realistic casual bedroom clothing inspired by each uploaded person’s style and silhouette.
+Avoid costume-like adaptation.
+
+LIGHTING FIX — VERY IMPORTANT:
+The generated faces must be fully integrated into the scene lighting naturally.
+
+Avoid:
+— blown highlights
+— overexposed skin
+— glowing foreheads
+— white patches
+— beauty-light skin
+— HDR look
+— artificial skin smoothing
+— waxy skin
+— hot spots from tungsten lighting
+— mismatched color temperature
+— pasted-on faces
+
+Lighting must follow:
+— soft warm tungsten practical lighting
+— smooth cinematic shadow gradients
+— physically realistic exposure
+— low-light indoor contrast
+— subtle ambient bounce light
+— natural skin reflectivity only
+— soft rolloff in highlights
+— preserved shadow detail
+— realistic occlusion around eyes, nose, jaw, and hair
+
+SKIN TEXTURE:
+Preserve:
+— pores
+— small asymmetries
+— natural under-eye texture
+— realistic teenage skin
+— subtle imperfections
+
+Do NOT retouch faces.
+
+IMAGE STYLE:
+Photorealistic cinematic still frame.
+Natural indie-drama aesthetic.
+Shallow depth of field.
+Authentic film-grain feel.
+No AI glamour look.
+No hyper-detailing.
+No uncanny symmetry.
+No synthetic beauty filtering.
+
+The final image must look like a real frame captured on a cinema camera with the uploaded people physically present in the room.`;
+
+const TITANIC_1 = `Replace all original people in the reference image with the exact adult individuals from the provided reference photos while preserving the original composition, pose dynamics, camera perspective, environment, lighting direction, framing, and cinematic atmosphere of the source image.
+
+CRITICAL IDENTITY REQUIREMENT:
+
+Do NOT reinterpret, beautify, stylize, age-shift, idealize, or loosely approximate the reference individuals.
+
+Reconstruct the people photorealistically using the exact identity and anatomy from the reference photos.
+
+Preserve with high precision:
+
+exact facial structure
+exact skull shape and proportions
+exact eye shape, spacing, and eyelids
+exact nose bridge, nostrils, and tip structure
+exact lips, mouth shape, and smile line geometry
+exact jawline, chin, and cheekbone structure
+exact eyebrow shape and density
+exact skin tone, pores, and texture
+exact hairstyle, hairline, hair thickness, and natural flyaway strands
+exact neck thickness and shoulder proportions
+exact body silhouette and posture
+exact natural asymmetry and identity-specific facial details
+
+Avoid generic AI-generated beauty enhancement.
+The final characters must clearly and unmistakably resemble the real people from the references.
+
+BACKGROUND PRESERVATION REQUIREMENT:
+
+Keep the original background nearly identical to the source image.
+
+Do NOT redesign or heavily modify:
+
+environment layout
+object placement
+architecture
+furniture
+street elements
+room geometry
+camera angle
+perspective
+lighting setup
+depth of field
+scene composition
+
+The result should feel like the same photograph with only the people replaced.
+
+CHARACTER REQUIREMENTS:
+
+Male character:
+
+Use the exact male reference identity. Preserve:
+
+natural face proportions
+realistic masculine anatomy
+exact hairstyle and facial structure
+natural neck and shoulder width
+accurate posture and body proportions
+realistic hands with anatomically correct fingers
+natural expression matching the scene mood
+
+Do not make him unnaturally muscular, older, broader, or more stylized than in the references.
+
+Female character:
+
+Use the exact female reference identity. Preserve:
+
+soft realistic facial anatomy
+exact facial proportions
+exact eyes, lips, and jawline
+natural hairstyle and hair texture
+slim realistic physique
+accurate shoulder and neck proportions
+natural expression and body posture
+realistic hand anatomy
+
+Do not alter her appearance into a glamorized or artificial version.
+
+IMPORTANT:
+
+This is NOT a simple face swap.
+
+The entire human subjects must be reconstructed from the references:
+identity, anatomy, proportions, silhouette, hairstyle, posture, body language, and physical presence.
+
+Maintain:
+
+realistic interaction between characters
+physically correct body positioning
+accurate contact shadows
+natural clothing folds
+realistic fabric tension
+proper body scaling
+natural skeletal proportions
+cinematic optical realism
+
+VISUAL DIRECTION CHANGE:
+
+Both characters must look forward toward the horizon exactly like in the original Titanic reference composition.
+Do NOT make either character look into the camera.
+Preserve the natural gaze direction and emotional focus of the original scene.
+
+VISUAL STYLE:
+
+ultra realistic cinematic photography
+photorealistic skin rendering
+DSLR movie still quality
+subtle film grain
+realistic dynamic range
+soft natural shadows
+high-detail skin pores
+shallow depth of field
+realistic lens compression
+natural color grading
+high-budget film still aesthetic
+emotionally believable cinematic atmosphere
+
+ANATOMY REQUIREMENTS:
+
+perfect human anatomy
+exactly five fingers per hand
+correct finger proportions
+realistic wrists and joints
+no fused fingers
+no extra limbs
+no distorted body parts
+accurate skeletal structure
+natural posture balance
+physically plausible interaction between characters
+
+All characters are adults over 18 years old.
+
+Negative prompt: inaccurate likeness, eye contact with camera, looking at viewer, weak resemblance, generic face, beautified AI face, altered identity, face swap only, malformed anatomy, deformed hands, extra fingers, fused fingers, missing fingers, distorted limbs, oversized head, asymmetrical eyes, unrealistic proportions, plastic skin, fake texture, CGI, 3D render, cartoon, anime, doll face, blurry image, low detail, oversharpening, oversaturated colors, warped anatomy, duplicate people, incorrect perspective, unrealistic lighting, bad composition, watermark, logo, text, childlike appearance, underage`;
+
+const TITANIC_2 = `Replace the two original characters in the cinematic scene with the exact two people from the provided reference photos.
+
+CRITICAL REQUIREMENT:
+Do NOT reinterpret, stylize, beautify, age-shift, or approximate the reference people. Reconstruct their identities faithfully and photorealistically using the exact facial structure and physical appearance from the references.
+
+The result must preserve:
+
+exact face shape
+exact eye shape and spacing
+exact nose structure
+exact lips and mouth shape
+exact jawline and chin
+exact eyebrow shape
+exact skin tone and texture
+exact hairstyle, hairline, and hair volume
+exact proportions of head, neck, shoulders, torso, and body silhouette
+exact natural asymmetry and facial uniqueness
+
+Avoid generic “pretty face” generation. The final characters must clearly look like the same real people from the reference photos.
+
+Male character:
+Use the exact male reference identity and appearance.
+Preserve:
+
+facial proportions
+tired soft eyes
+slim jawline
+messy medium-length dark hair
+realistic neck thickness
+narrow shoulders
+natural expression
+youthful but fully adult anatomy
+exact facial likeness
+
+Keep the original seated pose and interaction with the object in his hands.
+Do not change his body type or make him broader, older, or more masculine than in the reference.
+
+Female character:
+Use the exact female reference identity and appearance.
+Preserve:
+
+facial anatomy
+soft rounded facial structure
+exact eyes and lips
+long straight brown hair
+slim natural physique
+delicate shoulders and neck
+realistic facial proportions
+exact likeness to the reference
+
+Keep her gentle leaning pose over the male character’s shoulder with natural physical interaction and accurate body positioning.
+
+IMPORTANT:
+This is NOT a face swap.
+The entire people must be reconstructed from the references:
+identity, anatomy, posture, proportions, silhouette, hairstyle, and physical presence.
+
+Maintain the original cinematic environment:
+
+warm amber indoor lighting
+elegant vintage room
+dark background
+soft shadows
+shallow depth of field
+intimate composition
+movie still framing
+realistic optical lens behavior
+photorealistic skin rendering
+
+Ensure:
+
+realistic anatomy
+correct body scaling
+natural shoulder width
+realistic hand structure
+seamless lighting integration
+physically correct interaction between characters
+natural clothing folds
+realistic skin pores and texture
+DSLR cinematic detail
+ultra realistic movie still quality
+
+The final image should look like a real photographed scene from a high-budget romantic drama film.
+
+All characters are adults over 18 years old.
+
+Negative prompt:
+generic face, inaccurate likeness, weak resemblance, face swap only, different facial structure, altered identity, beautified face, unrealistic anatomy, oversized head, mismatched body, warped limbs, distorted proportions, bad hands, extra fingers, fake skin, smooth plastic skin, cartoon, anime, CGI, 3d render, doll face, blurry, low quality, oversaturated, watermark, logo, duplicate people, childlike appearance, underage`;
+
+const TITANIC_3 = `Create a cinematic romantic scene inspired by the original reference ship-deck atmosphere at sunset. Keep the environment composition, camera angle, lighting direction, framing, ship structure, deck details, ropes, railings, mast placement, background perspective, and overall visual atmosphere very close to the original reference image. Do not significantly alter the background or environment design.
+
+Replace the original couple with two adult people based on the provided reference photos.
+
+Use the reference individuals consistently and naturally throughout the image while preserving their exact recognizable facial structure, eye shape, nose, lips, jawline, hairstyle, hair texture, proportions, silhouette, and overall appearance. Maintain very high facial identity accuracy and realistic resemblance to both reference individuals.
+
+Scene composition:
+
+Adult male standing behind the adult female
+His arms gently wrapped around her waist
+Both leaning slightly toward each other in a calm emotional moment
+Elegant, natural posture and realistic body contact
+Medium close-up cinematic framing identical or very similar to the original reference composition
+Preserve the original ship deck layout and cinematic sunset atmosphere
+Ocean background with warm golden-hour lighting matching the reference image
+Shallow depth of field
+Dramatic romantic cinematic atmosphere
+
+IMPORTANT BACKGROUND REQUIREMENTS:
+
+Keep the background highly consistent with the original reference image
+Do not redesign the ship or environment
+Maintain similar deck proportions, railing placement, ropes, mast structure, horizon line, and sunset composition
+Preserve the same cinematic color palette and lighting mood
+Background should feel like the same scene as the original reference, only with the new people replacing the original couple
+
+Male:
+
+Match the male reference precisely and naturally
+Realistic proportions, shoulder width, neck anatomy, and posture
+Natural hairstyle, facial structure, and expression matching the reference
+Accurate hand anatomy with realistic wrists, palms, knuckles, fingernails, and exactly five fingers on each hand
+Believable arm placement and natural interaction with the female character
+Clothing adapted subtly and naturally to the original cinematic setting
+
+Female:
+
+Match the female reference precisely and naturally
+Preserve realistic proportions, hairstyle, facial features, expression, and posture
+Elegant pose with believable interaction and physically accurate anatomy
+Accurate hand anatomy with realistic finger spacing, fingernails, joints, and exactly five fingers on each hand
+Natural lighting and realistic skin texture
+Clothing adapted subtly and naturally to the original cinematic setting
+
+Critical anatomy requirements:
+
+Perfect human hand anatomy
+Exactly five fingers per hand
+No fused fingers
+No extra fingers
+No missing fingers
+Correct finger length and proportions
+Natural thumb placement
+Realistic joints, tendons, fingernails, and palm structure
+Anatomically correct wrists and arm positioning
+Symmetrical believable hands
+Natural body proportions and realistic skeletal structure
+
+Visual style:
+
+ultra realistic cinematic photography, movie still aesthetic, preserve original Titanic-like cinematic composition, photorealistic skin texture, DSLR-quality detail, natural cinematic color grading, subtle film grain, realistic shadows, shallow depth of field, emotionally cinematic atmosphere, highly detailed, physically accurate anatomy, realistic human proportions
+
+Negative prompt:
+
+changed background, different ship design, altered environment, incorrect deck structure, unrealistic scenery, low quality, blurry face, distorted anatomy, malformed hands, bad hands, deformed fingers, fused fingers, extra fingers, missing fingers, six fingers, duplicate fingers, warped limbs, broken anatomy, unrealistic proportions, asymmetrical hands, plastic skin, cartoon, anime, CGI, 3D render, oversaturated colors, watermark, logo, text, poorly drawn hands, mutated hands, distorted wrists, unnatural pose`;
+
+const THENOTEBOOK_1 = `Complete full-body identity replacement only. Treat all people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, facial geometry, facial structure, body anatomy. The reference image provides ONLY pose, composition, camera angle, lighting, environment, emotion, facial expression, gaze direction, head angle, and body posture. The uploaded male and female photos provide 100% of human appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces as geometry, mesh, scaffold, or template. Do NOT use reference bodies as anatomy templates. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap and NOT a head swap. Do not attach uploaded faces onto reference bodies. Reconstruct both uploaded people completely from head to toe as unified identities, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyebrows, nose shape, lips, mouth, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive features, body proportions, physique, silhouette, shoulders, torso, limbs, and overall appearance with maximum fidelity. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations or lookalikes. Preserve identity more than pose accuracy and more than expression accuracy. First reconstruct the uploaded people fully in 3D, then apply the reference pose. Never start from reference people, always start from uploaded identities. Re-render the uploaded people into the reference scene as complete new humans. The uploaded photos may show different angles, head tilts, expressions, or gaze direction—ignore all of that and rotate them into the exact head angle, neck angle, body angle, posture, and gaze direction shown in the reference image while keeping identity fully intact with no distortion or identity drift. Ignore emotions from uploaded photos and recreate the exact same emotional expressions from the reference image, preserving identical smile intensity, lip shape, eye expression, eyelid openness, eyebrow tension, cheek movement, facial muscle tension, and emotional intensity. Final result must look like authentic cinematic photography of the uploaded people naturally captured in this exact scene with seamless photorealistic integration, realistic anatomy, realistic skin pores, realistic hair strands, realistic proportions, and zero trace of the original reference identities. Negative prompt: reference face geometry, reference body anatomy, identity blending, facial blending, body blending, face morphing, face swap, head swap, partial replacement, pasted face, weak likeness, distorted face, asymmetrical eyes, altered proportions, changed expression, changed pose, CGI, cartoon, painting, low resolution, blurry, artifacts, ghosting, watermark, text.`
+
+const THENOTEBOOK_2 = `Complete full-body identity replacement only. Treat both people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, facial geometry, facial structure, body anatomy. The reference image provides ONLY pose, composition, camera angle, lighting, environment, emotion, facial expression, gaze direction, head angle, body angle, arm placement, embrace positioning, and posture. The uploaded male and female photos provide 100% of human appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces as geometry, mesh, scaffold, or template. Do NOT use reference bodies as anatomy templates. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap and NOT a head swap. Do not attach uploaded faces onto reference bodies. Reconstruct both uploaded people completely from head to toe as unified identities, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyebrows, nose shape, lips, mouth, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive features, body proportions, physique, silhouette, shoulders, torso, limbs, and overall appearance with maximum fidelity. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations or lookalikes. First reconstruct the uploaded people fully in 3D, then apply the reference pose. Never start from reference people, always start from uploaded identities. The uploaded photos may show different angles, head tilts, expressions, or gaze direction—ignore all of that and rotate them into the exact angles shown in the reference image while keeping identity fully intact. Preserve exactly the intimate embrace pose: male standing on left side, female standing on right side, male head in near-profile looking downward toward female, female head tilted upward toward male, identical eye contact, identical distance between faces, identical arm placement around shoulders and back, identical hand placement, identical body proximity, identical embrace pressure, and identical romantic body language. Ignore emotions from uploaded photos and recreate the exact same emotional expressions from the reference image: soft romantic affection, subtle warmth, intimate connection, gentle smile intensity, soft eyes, natural facial muscle tension. Final result must look like authentic cinematic photography of the uploaded people naturally captured in this exact moment with seamless photorealistic integration, realistic anatomy, realistic skin pores, realistic hair strands, realistic proportions, cinematic lighting, shallow depth of field, and zero trace of the original reference identities. Negative prompt: reference face geometry, reference body anatomy, identity blending, facial blending, body blending, face morphing, face swap, head swap, partial replacement, pasted face, weak likeness, distorted face, asymmetrical eyes, altered proportions, changed expression, changed pose, broken arms, bad hands, fused fingers, extra fingers, CGI, cartoon, painting, low resolution, blurry, artifacts, ghosting, watermark, text.`
+
+const THENOTEBOOK_3 = `Complete full-body identity replacement only. Treat both people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, facial geometry, facial structure, body anatomy. The reference image provides ONLY pose, composition, camera angle, lighting, environment, emotion, facial expression, gaze direction, head angle, body angle, lying position, and posture. The uploaded male and female photos provide 100% of human appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces as geometry, mesh, scaffold, or template. Do NOT use reference bodies as anatomy templates. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap and NOT a head swap. Do not attach uploaded faces onto reference bodies. Reconstruct both uploaded people completely from head to toe as unified identities, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyebrows, nose shape, lips, mouth, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive features, body proportions, physique, silhouette, shoulders, torso, limbs, and overall appearance with maximum fidelity. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations or lookalikes. Never start from reference people, always start from uploaded identities. First reconstruct the uploaded people fully in 3D, then apply the reference pose. The uploaded photos may show different angles, head tilts, expressions, or gaze direction—ignore all of that and rotate them into the exact angles shown in the reference image while keeping identity fully intact. This scene requires accurate horizontal face reconstruction because both people are lying down. Preserve facial proportions perfectly while rotating faces into lying positions. Do not distort face geometry because of perspective or horizontal pose. Preserve exactly: both subjects lying on their backs, heads close together, identical distance between heads, identical body proximity, identical camera perspective, identical head tilt, identical gaze direction, identical facial orientation. Female subject must preserve exact upward side gaze toward male, exact subtle warm smile, exact eye expression, exact soft romantic emotion. Male subject must preserve exact lying position, exact side profile angle, exact head placement, exact body position in foreground. Ignore emotions from uploaded photos and recreate the exact same emotional expressions from the reference image. Preserve identical romantic softness, subtle smile intensity, eye emotion, facial muscle tension, and intimate atmosphere. Final result must look like authentic cinematic photography of the uploaded people naturally captured in this exact moment with seamless photorealistic integration, realistic anatomy, realistic skin pores, realistic hair strands, realistic proportions, cinematic lighting, shallow depth of field, and zero trace of the original reference identities. Negative prompt: reference face geometry, reference body anatomy, identity blending, facial blending, body blending, face morphing, face swap, head swap, partial replacement, pasted face, weak likeness, distorted face, distorted jawline, distorted eyes, stretched face, asymmetrical eyes, altered proportions, changed expression, changed pose, CGI, cartoon, painting, low resolution, blurry, artifacts, ghosting, watermark, text.`
+
+const SUMMER500_1 = `Complete full-body identity replacement only. Treat all people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, facial geometry, facial structure, facial proportions, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, and body anatomy. The reference image provides ONLY pose, facial expression, emotion, gaze direction, eye contact, head rotation, head tilt, body positioning, hand placement, composition, camera angle, lighting, environment, and scene framing. The uploaded photos provide 100% of appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces or bodies as geometry, mesh, template, latent structure, or appearance source. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap, NOT a head swap, and NOT face pasting. Do not attach uploaded faces onto reference bodies. Reconstruct the uploaded people completely from head to toe as unified identities with maximum fidelity, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyelids, eyebrows, nose shape, lips, mouth shape, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive facial features, body proportions, physique, silhouette, shoulders, torso, arms, hands, and overall appearance. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations, not lookalikes, and not blended faces. ABSOLUTE IDENTITY LOCK: uploaded people must remain 100% identical to their uploaded photos. Reference people must contribute 0% identity information. Forbidden from reference people: eye shape, eye spacing, eyebrow shape, nose shape, lips, mouth shape, jawline, cheekbones, chin, skull shape, face width, face length, facial ratios, facial symmetry, hairline, hair structure, body anatomy. The reference people must contribute only pose, emotion, gaze direction, head rotation, head tilt, posture, hand placement, composition, and lighting. Preserve exact standing pose facing each other across the record bins. Preserve exact body angles and distance between both people. Preserve exact head rotation and slight head tilt toward each other. Preserve exact mutual eye contact. Preserve exact soft romantic smile and subtle flirtatious expression on both faces. Ignore expressions from uploaded photos and recreate the exact emotional expression from the reference image while keeping identity fully intact. The final image must look like authentic cinematic photography of the uploaded people naturally captured in this exact scene with realistic anatomy, realistic skin texture, realistic hair strands, perfect facial proportions, and zero trace of the original reference identities. Negative prompt: reference facial features, reference body anatomy, identity blending, facial blending, body blending, face morphing, head swap, pasted face, weak likeness, inaccurate facial features, distorted face, altered facial proportions, changed expression, changed eye contact, changed head angle, changed posture, changed body proportions, blurry, artifacts, low detail.`
+
+const SUMMER500_2 = `Complete full-body identity replacement only. Treat all people in the reference image as empty pose and expression placeholders with zero usable identity. Completely remove and ignore 100% of the original people: face, head, skull shape, facial geometry, facial proportions, facial structure, eyes, eyebrows, nose, lips, jawline, cheekbones, chin, ears, hair, neck, shoulders, torso, arms, hands, body proportions, silhouette, and anatomy. The reference image provides ONLY pose, body positioning, facial expression, gaze direction, head rotation, head tilt, hand placement, clothing layout, environment, composition, lighting, and camera framing. The uploaded photos provide 100% of identity and anatomy. Build entirely new people from the uploaded photos only. This is NOT a face swap, NOT a head swap, NOT face pasting. Do not overlay uploaded faces onto reference bodies. Fully regenerate both people from scratch as complete identities from head to toe using uploaded photos only. Preserve exactly their real facial proportions, skull shape, forehead, eyes, eyelids, eye spacing, eyebrows, nose shape, lips, mouth shape, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, asymmetry, unique facial features, body proportions, shoulders, torso, arms, hands, posture, silhouette, and overall physique. Identity accuracy is absolute priority. The final people must look exactly like the real individuals from uploaded photos, with zero blending from reference identities. Reference identities must contribute 0% appearance data. Forbidden from reference people: facial structure, facial ratios, eye shape, eyebrow shape, nose shape, lips, jawline, cheekbones, chin, skull shape, hairline, hair texture, body shape, anatomy, physique. Preserve exact sitting pose on the grass. Male subject sits centered with legs crossed, torso upright but relaxed, body slightly angled toward the female, hands together near notebook, head slightly turned toward female. Preserve exact gentle smile and calm warm expression. Female subject sits very close on his right side, body leaning subtly toward him, torso angled toward male, one arm supporting her posture, head slightly tilted toward him. Preserve exact soft affectionate gaze and subtle romantic smile. Recreate exact emotional chemistry from reference: warm, intimate, playful, comfortable connection. Ignore expressions from uploaded photos and regenerate the uploaded people with the exact expressions, eye direction, head angle, and emotional mood of the reference while keeping identity fully intact. Preserve exact park environment, grass, blanket, books, soft natural daylight, shallow depth of field, and cinematic framing. Final result must look like authentic cinematic photography with realistic anatomy, realistic skin texture, realistic hair strands, correct hands, perfect facial proportions, and zero trace of the original reference identities. Negative prompt: reference facial features, reference anatomy, identity blending, face blending, body blending, face swap look, pasted face, weak likeness, distorted face, altered facial proportions, wrong expression, wrong gaze, wrong head angle, wrong posture, blurry, artifacts, low detail.`
+
+const SUMMER500_3 = `Complete full-body identity replacement only. Treat all people in the reference image as empty pose and expression placeholders with zero usable identity. Completely remove and ignore 100% of the original people: face, head, skull shape, facial geometry, facial proportions, eyes, eyebrows, nose, lips, mouth shape, jawline, cheekbones, chin, hair, neck, shoulders, torso, arms, hands, body proportions, silhouette, anatomy, and all identity features. The reference image provides ONLY pose, facial expression, emotional energy, gaze direction, head rotation, head tilt, body positioning, hand placement, environment, composition, lighting, and camera framing. The uploaded photos provide 100% of identity and anatomy. Build entirely new people from uploaded photos only. This is NOT face swap, NOT head swap, NOT pasted faces. Do not overlay uploaded faces onto reference bodies. Fully regenerate both people from scratch as complete identities from head to toe using uploaded photos only. Preserve exactly their real facial structure, skull shape, forehead, eye shape, eye spacing, eyelids, eyebrows, nose shape, lips, mouth shape, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, unique facial features, body proportions, shoulders, torso, arms, hands, silhouette, physique, and overall appearance. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact real individuals from uploaded photos, not approximations and not blended with reference identities. Reference identities contribute 0% appearance data. Forbidden from reference people: facial structure, eye shape, eyebrow shape, nose shape, lips, mouth shape, jawline, cheekbones, chin, skull shape, hairline, hair texture, body anatomy, silhouette, physique. Preserve exact cinema seating positions and body placement. Preserve exact leaning posture toward each other. Preserve exact emotional interaction and chemistry. Male subject must have the exact expression from reference: wide genuine smile, relaxed face, warm affectionate gaze directed toward female subject, head slightly turned toward her. Female subject must have the exact expression from reference: spontaneous strong laughter, joyful open-mouth smile, eyes naturally narrowed or nearly closed from laughing, relaxed playful posture, head slightly tilted. This emotional recreation is critical. Ignore expressions from uploaded photos and regenerate the uploaded people with the exact expressions, head angles, gaze direction, and emotional mood from the reference while keeping identity fully intact. Very important: even during strong laughter and intense smiling, do NOT distort identity or facial proportions. Preserve uploaded identity perfectly under extreme expressions. Preserve exact movie theater environment, popcorn, cinematic low-key lighting, shallow depth of field, warm highlights, and natural scene composition. Final result must look like authentic cinematic photography with realistic anatomy, realistic skin texture, realistic hair strands, accurate hands, correct facial proportions, and zero trace of the original reference identities. Negative prompt: reference facial features, reference anatomy, identity blending, face blending, body blending, pasted face, weak likeness, distorted face, changed facial proportions, wrong smile, weak emotion, wrong laughter, wrong gaze, wrong posture, blurry, artifacts, low detail.`
+
+const TWILIGHT_1 = `Complete full-body identity replacement only. Treat both people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, facial geometry, facial structure, body anatomy. The reference image provides ONLY pose, composition, camera angle, lighting, environment, emotion, facial expression, gaze direction, head angle, body angle, sitting position, and posture. The uploaded male and female photos provide 100% of human appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces as geometry, mesh, scaffold, or template. Do NOT use reference bodies as anatomy templates. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap and NOT a head swap. Do not attach uploaded faces onto reference bodies. Reconstruct both uploaded people completely from head to toe as unified identities, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyebrows, nose shape, lips, mouth, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive features, body proportions, physique, silhouette, shoulders, torso, limbs, and overall appearance with maximum fidelity. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations or lookalikes. Never start from reference people, always start from uploaded identities. First reconstruct the uploaded people fully in 3D, then apply the reference pose. The uploaded photos may show different angles, head tilts, expressions, or gaze direction—ignore all of that and rotate them into the exact angles shown in the reference image while keeping identity fully intact. This scene requires accurate downward face reconstruction because both subjects are looking downward. Preserve facial proportions perfectly under low light and downward head tilt. Do not distort facial geometry because of shadows, reflections, or camera angle. Preserve exactly: both subjects sitting close together at the piano, identical body spacing, identical shoulder distance, identical sitting posture, identical head tilt downward, identical gaze direction toward piano keys, identical body orientation, identical subtle body language. Preserve exact emotional tone: quiet intimacy, calm emotional focus, subtle connection, gentle seriousness, soft contemplative expression. Ignore emotions from uploaded photos and recreate the exact same emotional expressions from the reference image. Reflection consistency is mandatory: reflections visible on the piano surface must match the newly generated uploaded identities and must not contain any features from the reference people. No old faces or mixed identities may appear in reflections. Preserve environment exactly: grand piano, piano reflections, cold blue cinematic lighting, dark room atmosphere, shadows, composition, framing, and depth. Final result must look like authentic cinematic photography of the uploaded people naturally captured in this exact moment with seamless photorealistic integration, realistic anatomy, realistic skin pores, realistic hair strands, realistic proportions, realistic reflections, cinematic low-light realism, and zero trace of the original reference identities. Negative prompt: reference face geometry, reference body anatomy, identity blending, facial blending, body blending, face morphing, face swap, head swap, partial replacement, pasted face, weak likeness, distorted face, distorted jawline, asymmetrical eyes, altered proportions, changed expression, changed pose, incorrect reflections, mixed reflections, old reflection face, CGI, cartoon, painting, low resolution, blurry, artifacts, ghosting, watermark, text.`
+
+const TWILIGHT_2 = `Complete full-body identity replacement only. Treat both people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, facial geometry, facial structure, body anatomy. The reference image provides ONLY pose, composition, camera angle, lighting, environment, emotion, facial expression, gaze direction, head angle, body angle, arm placement, embrace positioning, and posture. The uploaded male and female photos provide 100% of human appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces as geometry, mesh, scaffold, or template. Do NOT use reference bodies as anatomy templates. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap and NOT a head swap. Do not attach uploaded faces onto reference bodies. Reconstruct both uploaded people completely from head to toe as unified identities, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyebrows, nose shape, lips, mouth, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive features, body proportions, physique, silhouette, shoulders, torso, limbs, and overall appearance with maximum fidelity. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations or lookalikes. Never start from reference people, always start from uploaded identities. First reconstruct the uploaded people fully in 3D, then apply the reference pose. The uploaded photos may show different angles, head tilts, expressions, or gaze direction—ignore all of that and rotate them into the exact angles shown in the reference image while keeping identity fully intact. This scene requires highly accurate side-angle face reconstruction because both subjects are viewed in near-profile and three-quarter angles. Preserve facial proportions perfectly under side view and close facial proximity. Do not distort facial geometry because of angle, proximity, or lighting. Preserve exactly: male standing on left side, female standing on right side, identical body proximity, identical distance between faces, identical eye contact, identical head tilt, identical face orientation, identical shoulder position, identical embrace pose, identical hand placement of female on male chest and shoulder, identical arm positions, identical romantic body language. Ignore emotions from uploaded photos and recreate the exact same emotional expressions from the reference image. Preserve exact emotional tone: intense romantic tension, intimate emotional connection, subtle softness, deep eye contact, soft lips, calm breathing, strong chemistry. Preserve environment exactly: warm evening lighting, cinematic bokeh lights, shallow depth of field, dance setting, background blur, framing, and composition. Final result must look like authentic cinematic photography of the uploaded people naturally captured in this exact moment with seamless photorealistic integration, realistic anatomy, realistic skin pores, realistic hair strands, realistic proportions, cinematic lighting, and zero trace of the original reference identities. Negative prompt: reference face geometry, reference body anatomy, identity blending, facial blending, body blending, face morphing, face swap, head swap, partial replacement, pasted face, weak likeness, distorted face, distorted jawline, asymmetrical eyes, altered proportions, changed expression, changed pose, incorrect eye contact, CGI, cartoon, painting, low resolution, blurry, artifacts, ghosting, watermark, text.`
+
+const TWILIGHT_3 = `Complete full-body identity replacement only. Treat all people in the reference image as empty pose skeletons with zero usable identity and zero usable anatomy. Completely delete and ignore 100% of the original people before generation: face, head, skull shape, facial geometry, facial structure, neck, shoulders, torso, arms, hands, body proportions, silhouette, physique, and body anatomy. The reference image provides ONLY pose, emotion, facial expression, gaze direction, head rotation, head tilt, body positioning, composition, camera angle, lighting, environment, and scene framing. The uploaded photos provide 100% of appearance and anatomy. Build entirely new people from uploaded photos only. Do NOT use reference faces as geometry, mesh, scaffold, latent template, or appearance source. Do NOT use reference bodies as anatomy templates. No facial blending and no body blending allowed. Zero identity contribution from reference people. This is NOT a face swap, NOT a head swap, and NOT face pasting. Do not attach uploaded faces onto reference bodies. Reconstruct the uploaded people completely from head to toe as unified identities with maximum fidelity, preserving exactly their facial proportions, skull shape, forehead, eyes, eye spacing, eyelids, eyebrows, nose shape, lips, mouth shape, jawline, chin, cheekbones, ears, hairline, hairstyle, hair texture, skin tone, skin texture, facial asymmetry, distinctive facial features, body proportions, physique, silhouette, shoulders, torso, limbs, and overall appearance. Identity accuracy is the highest priority. The final people must be instantly recognizable as the exact same real individuals from the uploaded photos, not approximations, not lookalikes, and not blended faces. ABSOLUTE IDENTITY LOCK: the uploaded people must remain 100% identical to their uploaded photos. The reference people must contribute 0% identity information. Forbidden from reference people: eye shape, eye spacing, eyelid shape, eyebrow shape, nose shape, nose bridge, nose width, lips, mouth shape, jawline, cheekbones, chin, skull shape, face width, face length, facial proportions, facial ratios, facial symmetry, hairline, hair structure. The reference people must contribute only pose, emotion, gaze direction, head rotation, body positioning, composition, and lighting. Nothing else. If identity conflicts with pose accuracy, always prioritize identity. Identity > pose. Identity > emotion. Identity > composition. RECONSTRUCTION RULE: do not transform reference people into uploaded people. This is forbidden. Instead: 1) delete reference people completely, 2) reconstruct uploaded people from scratch, 3) place uploaded people into reference pose. Never start from reference people, always start from uploaded identities. The uploaded photos may show different angles, head tilts, expressions, or gaze direction—ignore all of that and rotate them into the exact angles shown in the reference image while keeping identity fully intact with no distortion, no identity drift, and no facial deformation. Preserve exact head rotation, head tilt, gaze direction, body angle, posture, body language, and facial orientation from the reference image. Ignore emotions from uploaded photos and recreate the exact same emotional expressions from the reference image, preserving identical smile intensity, lip shape during expression, eye expression, eyelid openness, eyebrow tension, cheek movement, facial muscle tension, emotional intensity, romantic tension, and chemistry. Final result must look like authentic cinematic photography of the uploaded people naturally captured in this exact scene with seamless photorealistic integration, realistic anatomy, realistic skin pores, realistic hair strands, realistic body proportions, and zero trace of the original reference identities. Negative prompt: reference face geometry, reference body anatomy, original actor facial features, original actor body proportions, identity blending, facial blending, body blending, face morphing, face swap, head swap, partial replacement, pasted face, pasted head, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, altered facial proportions, changed expression, changed emotion, changed gaze direction, changed head angle, changed posture, changed body proportions, CGI, cartoon, anime, illustration, painting, blurry, low resolution, artifacts, ghosting, watermark, logo, text.`
+
+const AMERICANPSYCHO_1 = `Replace the original person completely with the person from the uploaded reference photo.
+
+The uploaded reference photo is the absolute and exclusive source of the person's identity.
+
+The final person's face must be 100% the face of the reference person. Transfer the exact facial identity from the reference image, including facial geometry, bone structure, eye shape, eyelids, eyebrows, nose, lips, mouth shape, cheekbones, jawline, chin, forehead, facial proportions, skin details, and all unique recognizable facial characteristics.
+
+The original person's face from the template image must be completely removed and must not influence the final result in any way.
+
+Do not preserve, copy, or blend any facial features from the original subject. Do not create a hybrid face. Do not create a similar-looking version of the original actor. The original actor's facial identity must be erased completely.
+
+The result must look like the exact person from the reference photo was physically present in the original movie scene.
+
+The reference person should keep their own natural face structure and recognizable identity while adopting only the scene's pose, camera angle, lighting, expression, and emotional performance.
+
+Transfer the expression only through facial muscle positioning, eye direction, gaze, head orientation, and posture. Never transfer the actor's facial identity, facial structure, or facial characteristics.
+
+The eyes, nose, mouth, and facial proportions must belong entirely to the reference person.
+
+The person in the final image must be immediately recognizable as the same individual from the reference photo.
+
+Reconstruct the complete reference person inside the scene:
+face, head, hair, neck, shoulders, torso, arms, hands, body proportions, and physique.
+
+The original actor's body and facial appearance must not remain. Replace the entire subject with the reference person while preserving the exact pose, clothing, environment, camera composition, and cinematic style.
+
+Match the original scene's lighting, shadows, color grading, contrast, depth of field, and film texture to make the reference person naturally belong in the location.
+
+Apply realistic cinematic integration:
+natural skin rendering, realistic pores, accurate skin texture, realistic facial volume, natural highlights, realistic shadow transitions, and authentic photographic details.
+
+The final image must look like a real film frame captured with the reference person as the original actor.
+
+No identity blending.
+No face mixing.
+No hybrid appearance.
+No actor resemblance.
+No AI face replacement look.
+No pasted face.
+No Photoshop effect.
+
+Only the reference person's identity.
+Only the reference person's facial features.
+Only the reference person's appearance.
+
+Photorealistic cinematic realism, seamless integration, perfect identity transfer, ultra realistic face reconstruction, premium movie-quality image.`
+
+const AMERICANPSYCHO_2 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+The uploaded reference photo is the absolute and exclusive source of identity. The final person must be the exact same individual from the reference photo.
+
+Preserve the reference person's identity with maximum accuracy and priority. Preserve the complete facial identity, including face shape, facial geometry, facial proportions, bone structure, forehead shape, eye shape, eyelids, eyebrows, eyebrow spacing, nose shape, nose bridge, nose width, nostrils, lips, mouth shape, lip thickness, smile structure, jawline, chin shape, cheekbones, cheeks, ears, skin texture, skin details, facial asymmetry, and every unique recognizable characteristic of the reference person.
+
+The original person's face from the template image must be completely removed. The original subject must have zero influence on the final facial identity.
+
+Do not inherit, borrow, preserve, copy, merge, mix, or blend any facial features from the template person.
+
+Do not create a hybrid face.
+Do not create a similar version of the original person.
+Do not keep the original person's eyes, nose, lips, jawline, cheekbones, facial proportions, bone structure, or skin characteristics.
+
+The final face must belong entirely to the reference person.
+
+Identity comes only from the reference photo.
+Pose, camera position, lighting, environment, and emotional performance come only from the template image.
+
+The reference person must remain fully recognizable while naturally performing the exact scene shown in the template image.
+
+Transfer only the expression mechanics from the template image. Do not transfer the identity of the expression.
+
+Recreate the same facial movement, emotional intensity, gaze direction, eye focus, eyelid position, eyebrow position, eyebrow tension, forehead tension, cheek activation, mouth position, lip curvature, smile shape, jaw position, head angle, head rotation, head tilt, and facial muscle activation shown in the template image.
+
+The expression must be generated on the reference person's own face anatomy. The reference person's facial structure must never change to resemble the template subject.
+
+The smile, if present, must be the reference person's own mouth and facial anatomy performing the same smile pattern as the template image.
+
+The eyes are extremely important. Preserve the exact eyes of the reference person while recreating the same gaze direction, attention, intensity, emotional state, and eye behavior from the template image.
+
+The final person should look like the reference person was the actual actor in this exact scene.
+
+Transfer the complete person from the reference image, including face, head, hairstyle, hair texture, neck, shoulders, chest, torso, waist, hips, arms, elbows, forearms, wrists, hands, fingers, body shape, body proportions, and physique.
+
+Reconstruct the anatomy of the reference person naturally inside the scene. The original subject's body proportions, shoulder structure, neck shape, arm structure, hand structure, and physique must not remain.
+
+Do not perform a simple face swap.
+
+Replace the entire identity of the original person with the reference person while preserving the exact pose, posture, body language, clothing, accessories, and scene composition.
+
+The person should wear the original clothing naturally, with the clothing adapted to the reference person's anatomy and body proportions.
+
+Match the exact cinematic conditions of the template image, including lighting direction, shadow placement, contrast, exposure, highlights, reflections, color temperature, atmosphere, depth, lens characteristics, and film look.
+
+Apply realistic skin rendering to the reference person:
+natural pores,
+realistic skin texture,
+subtle skin imperfections,
+natural facial volume,
+realistic subsurface scattering,
+accurate facial shading,
+realistic highlights,
+natural shadow transitions,
+and authentic photographic detail.
+
+The reference person must appear physically present in the original location, photographed by the same camera, under the same lighting conditions, with the same cinematic quality.
+
+The result must not look like:
+a face swap,
+a pasted face,
+a Photoshop edit,
+an AI-generated replacement,
+a synthetic composite,
+or a blended identity.
+
+The final image must look like a genuine frame from the original movie where the reference person was the original performer.
+
+Keep all clothing, accessories, objects, hand positions, body posture, camera angle, framing, perspective, depth of field, background blur, environment, and composition unchanged.
+
+Do not modify the background, other people, objects, atmosphere, environment, lighting setup, or image composition.
+
+Photorealistic, perfect identity preservation, seamless person replacement, realistic anatomy, natural skin texture, realistic facial structure, cinematic photography, ultra detailed, premium film-quality realism.`
+
+const AMERICANPSYCHO_3 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+The uploaded reference photo is the absolute and exclusive source of the person's identity and physical appearance.
+
+Priority 1: Preserve the reference person's identity with maximum possible fidelity and accuracy.
+
+Priority 2: Recreate the exact pose, body language, facial expression mechanics, gaze direction, and emotional state from the template image while keeping the reference person's identity completely unchanged.
+
+Priority 3: Match the cinematic environment, lighting, shadows, color grading, atmosphere, and visual style of the template image.
+
+The final person must be the exact same individual from the reference photo placed naturally into the original scene.
+
+The original actor's identity must be completely erased.
+
+The template person's face must have zero influence on the final facial identity.
+
+Do not preserve, inherit, borrow, copy, mix, blend, merge, or recreate any facial characteristics from the original subject.
+
+Do not keep the original actor's:
+face shape,
+facial proportions,
+bone structure,
+eye shape,
+eyelid structure,
+eyebrow shape,
+nose shape,
+nose bridge,
+nostril shape,
+lip shape,
+mouth structure,
+jawline,
+chin,
+cheekbones,
+cheek structure,
+forehead shape,
+ears,
+hairline,
+skin characteristics,
+age appearance,
+or any recognizable facial traits.
+
+No hybrid face.
+No identity mixing.
+No combination of two people.
+No resemblance to the original actor.
+
+The final face must belong entirely to the reference person.
+
+Preserve the reference person's complete facial identity with maximum detail:
+
+Keep the exact face geometry, facial proportions, natural asymmetry, unique facial landmarks, eye spacing, eye shape, eyelid structure, eyebrow placement, nose shape, nose width, nose bridge, nostril shape, lip structure, mouth proportions, jawline, chin shape, cheekbone structure, forehead proportions, ear shape, skin texture, skin tone, facial volume, and all distinctive characteristics that make the person recognizable.
+
+Do not beautify, idealize, redesign, stylize, enhance, smooth, modify, age, rejuvenate, or reinterpret the reference person's appearance.
+
+The reference person must remain completely recognizable as the same individual from the uploaded photo.
+
+Identity comes exclusively from the reference photo.
+
+The template image provides only:
+pose,
+camera angle,
+body position,
+head orientation,
+gaze direction,
+facial muscle movement,
+emotional state,
+lighting,
+environment,
+and cinematic appearance.
+
+Transfer the expression only through facial muscle positioning and performance.
+
+Do not transfer the original actor's facial identity together with the expression.
+
+Recreate the same smile, emotion, attitude, and psychological presence from the template image while keeping the reference person's own facial anatomy.
+
+Match the exact expression mechanics:
+mouth position,
+lip curvature,
+smile intensity,
+smile asymmetry,
+cheek activation,
+cheek tension,
+eye focus,
+eyelid position,
+eyebrow position,
+forehead tension,
+facial muscle activation,
+jaw position,
+head angle,
+head rotation,
+head tilt,
+gaze direction,
+and emotional presence.
+
+The smile and expression must be generated naturally on the reference person's face, using only the reference person's facial structure.
+
+The final result must look like the reference person personally performed this exact scene.
+
+Transfer the entire person from the reference photo, including face, head, hairstyle, hair texture, hairline, neck, shoulders, chest, torso, waist, hips, arms, elbows, forearms, wrists, hands, fingers, body shape, proportions, and physique.
+
+Reconstruct the complete person using the reference person's own anatomy.
+
+Do not preserve the original actor's body structure, shoulder width, neck shape, arm proportions, hand shape, physique, or anatomy.
+
+The clothing and scene should remain unchanged, but the person wearing the clothing must be the reference person with their own natural body proportions.
+
+Do not perform a simple face swap.
+
+Replace the entire person.
+
+The result should look as if the reference person was the real actor originally photographed in this movie scene.
+
+Match the exact cinematic lighting of the template image.
+
+Recreate:
+light direction,
+light intensity,
+shadow placement,
+ambient illumination,
+skin illumination,
+facial highlights,
+reflected light,
+contrast,
+exposure,
+color temperature,
+depth,
+atmosphere,
+and cinematic mood.
+
+Integrate the reference person's face naturally into the scene by matching the existing lighting conditions.
+
+Preserve realistic facial volume and realistic interaction between the face and environment.
+
+Apply realistic skin rendering:
+
+natural pores,
+real skin texture,
+subtle skin imperfections,
+accurate skin tone response,
+realistic subsurface scattering,
+natural highlights,
+realistic shadow transitions,
+facial depth,
+three-dimensional facial structure,
+and authentic photographic detail.
+
+Match the movie's:
+film grain,
+contrast curve,
+color palette,
+lens characteristics,
+depth of field,
+background blur,
+and cinematic grading.
+
+The inserted person must appear naturally photographed in the scene.
+
+The result must not look like:
+a face swap,
+a pasted face,
+a Photoshop edit,
+a digital composite,
+an AI-generated replacement,
+or a blended identity.
+
+Preserve realistic hair rendering, realistic skin behavior, realistic anatomy, realistic shadows, and seamless integration.
+
+Keep all clothing, accessories, objects, hand positions, body posture, camera angle, framing, perspective, depth of field, environment, and composition unchanged.
+
+Do not modify the background, other people, objects, atmosphere, environment, lighting setup, or image composition.
+
+Photorealistic, perfect identity preservation, complete person replacement, seamless cinematic integration, realistic anatomy, natural skin texture, realistic hair texture, realistic shadows, realistic facial structure, ultra detailed, premium film-quality realism.`
+
+const FIGHTCLUB_1 = `Replace only the foreground person holding the pink soap bar with the person from the uploaded reference photo.
+
+Use the reference photo as the source of the person's identity, facial features, hairstyle, skin tone, body shape, body proportions, physique, shoulder width, neck shape, arm proportions, hand shape, posture characteristics, and overall appearance.
+
+Preserve the unique facial characteristics of the reference person so the resulting person clearly looks like the same individual.
+
+The person should fully recreate the exact facial expression, emotion, intensity, confidence, eye direction, gaze, eyelid position, head rotation, head tilt, mouth shape, facial tension, jaw position, facial muscle expression, attitude, and overall emotional presence of the foreground person in the template image. The emotional expression is the highest priority and should closely match the foreground person's expression in the template image.
+
+Transfer the entire person, including face, head, hair, neck, shoulders, chest, torso, waist, hips, arms, elbows, forearms, wrists, hands, fingers, body shape, proportions, and physique. Adapt the body, arms, hands, shoulders, neck, posture, and overall anatomy to match the reference person rather than the original foreground person.
+
+Do not perform a face swap. Do not keep any facial features, body proportions, anatomy, hands, arms, shoulders, neck, or physique from the original foreground person. Reconstruct the complete person from the reference photo in the exact pose, expression, body language, head position, and gesture of the foreground person in the template image.
+
+Match the exact facial lighting, shadows, contrast, skin shading, facial contours, depth, highlights, color grading, facial volume, shadow transitions, and overall facial structure created by the lighting in the template image.
+
+Apply the same warm yellow cinematic filter, yellow-green color grading, skin rendering, skin texture, contrast curve, shadow depth, highlight rolloff, facial texture, gritty film-like processing, image texture, color palette, and overall visual grading as the template image. Recreate the same yellow-tinted skin appearance, skin tone rendering, lighting mood, atmosphere, and cinematic look as the template.
+
+Process the face and skin to match the template: realistic pores, natural imperfections, facial roughness, subtle oily highlights, deep shadows, warm yellow highlights, greenish shadow tint, realistic facial shading, and detailed cinematic skin texture.
+
+The inserted person should look as if they were originally photographed in the same shot with the same camera, lens, yellow cinematic lighting setup, and post-processing.
+
+The person should appear naturally photographed in the scene, not composited, pasted, edited onto another body, or look like a Photoshop edit. Preserve realistic facial volume, realistic shadow transitions, natural skin texture, seamless integration, and cinematic realism.
+
+Keep the exact hand position holding the soap bar, grip, arm position, clothing style, camera angle, framing, perspective, lighting, cinematic color grading, depth of field, and composition from the template image.
+
+Do not modify, replace, edit, regenerate, or alter the background person. Keep the background person exactly as shown in the template image.
+
+Keep the soap bar, background, environment, objects, lighting setup, atmosphere, and image composition unchanged.
+
+Photorealistic, seamless integration, realistic anatomy, natural skin texture, cinematic photography, high detail, realistic shadows, realistic facial structure, natural proportions, premium film-quality realism.`
+
+const FIGHTCLUB_2 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+Use the reference photo as the source of the person's identity, facial features, hairstyle, skin tone, body shape, body proportions, physique, shoulder width, neck shape, posture characteristics, and overall appearance.
+
+Preserve the unique facial characteristics of the reference person so the resulting person clearly looks like the same individual.
+
+The facial expression is the highest priority.
+
+Precisely recreate the exact emotional state of the template subject. Match the same exhausted, emotionally drained, sleep-deprived, detached, empty, and emotionally numb expression.
+
+Recreate the same tired eyes, heavy eyelids, subtle eye redness, neutral mouth position, relaxed facial muscles, slight facial fatigue, emotional detachment, mental exhaustion, and overall feeling of burnout visible in the template image.
+
+Match the exact gaze direction, eye openness, eyelid position, eye tension, mouth shape, jaw relaxation, facial muscle activity, head position, head angle, head tilt, posture, and emotional atmosphere of the template image.
+
+There should be no smile, no excitement, no confidence, no aggression, no happiness, and no exaggerated expression. The face should remain subtle, restrained, tired, emotionally drained, and psychologically exhausted.
+
+Prioritize matching the exact emotional expression and psychological state from the template image over all other facial attributes except identity preservation.
+
+Transfer the entire person, including face, head, hair, neck, shoulders, chest, torso, arms, hands, body shape, proportions, and physique. Adapt the body, shoulders, neck, posture, and overall anatomy to match the reference person rather than the original subject.
+
+Do not perform a face swap. Do not keep any facial features, body proportions, anatomy, shoulders, neck, or physique from the original subject. Reconstruct the complete person from the reference photo in the exact pose, posture, body language, gaze direction, expression, and emotional state of the template subject.
+
+Match the exact greenish cinematic color grading, cool skin tones, fluorescent office lighting, facial shadows, skin texture, under-eye shadows, contrast, depth, highlights, facial contours, and overall visual atmosphere of the template image.
+
+Apply the same skin rendering, skin texture, facial detail, shadow structure, color palette, image texture, and cinematic grading as the template image. Recreate the same tired skin appearance, under-eye detail, facial shading, realistic pores, and subtle imperfections visible in the template.
+
+The inserted person should appear naturally photographed in the scene, not composited, pasted, edited onto another body, or look like a Photoshop edit. Preserve realistic facial volume, realistic skin texture, realistic shadow transitions, and seamless integration.
+
+Keep the exact shirt, tie, posture, camera angle, framing, perspective, depth of field, background blur, lighting setup, and composition unchanged.
+
+Do not modify the background, environment, objects, atmosphere, lighting setup, or image composition.
+
+Photorealistic, seamless integration, realistic anatomy, natural skin texture, realistic shadows, realistic facial structure, cinematic photography, high detail, premium film-quality realism.`
+
+const FIGHTCLUB_3 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+Use the reference photo as the source of the person's identity, facial features, hairstyle, skin tone, body shape, body proportions, physique, shoulder width, neck shape, posture characteristics, and overall appearance.
+
+Preserve the unique facial characteristics of the reference person so the resulting person clearly looks like the same individual.
+
+The facial expression and attitude are the highest priority.
+
+Precisely recreate the exact emotional expression, confidence, charisma, relaxed dominance, self-assurance, fearlessness, and calm attitude of the template subject.
+
+Match the exact eye direction, gaze, eyelid position, facial muscle tension, jaw position, mouth shape, slightly parted lips, head angle, head rotation, head tilt, posture, body language, and emotional presence shown in the template image.
+
+The person should convey the same effortless confidence, relaxed control, subtle intensity, and charismatic presence as the original subject.
+
+There should be no forced smile, no exaggerated emotion, and no artificial expression. Preserve the same natural, relaxed, confident facial expression and emotional energy visible in the template image.
+
+Prioritize matching the exact emotional expression, gaze, attitude, and body language from the template image over all other facial attributes except identity preservation.
+
+Transfer the entire person, including face, head, hair, neck, shoulders, chest, torso, waist, hips, arms, elbows, forearms, wrists, hands, fingers, body shape, proportions, and physique. Adapt the body, shoulders, neck, posture, and overall anatomy to match the reference person rather than the original subject.
+
+Do not perform a face swap. Do not keep any facial features, body proportions, anatomy, shoulders, neck, arms, hands, or physique from the original subject. Reconstruct the complete person from the reference photo in the exact pose, posture, body language, gaze direction, expression, and attitude of the template subject.
+
+Match the exact cinematic night lighting, shadows, contrast, skin texture, facial contours, highlights, depth, color grading, and visual atmosphere of the template image.
+
+Apply the same warm cinematic skin rendering, shadow structure, facial texture, realistic skin detail, film-like grading, image texture, color palette, and night-scene lighting as the template image.
+
+The inserted person should appear naturally photographed in the scene, not composited, pasted, edited onto another body, or look like a Photoshop edit. Preserve realistic facial volume, realistic shadow transitions, realistic skin texture, and seamless integration.
+
+Keep the exact jacket, shirt, hand placement, body posture, camera angle, framing, perspective, lighting setup, background, environment, depth of field, and composition unchanged.
+
+Do not modify the background, car, environment, objects, atmosphere, lighting setup, or image composition.
+
+Photorealistic, seamless integration, realistic anatomy, natural skin texture, realistic shadows, realistic facial structure, cinematic photography, high detail, premium film-quality realism.`
+
+// ── Terminator ──
+
+const TERMINATOR_1 = `Replace only the main person on the motorcycle with the person from the uploaded reference photo.
+
+Identity preservation is the absolute top priority.
+
+The reference photo is the only source of identity. Preserve the exact facial identity and body characteristics of the reference person with maximum fidelity. Keep exact face shape, facial proportions, bone structure, eye shape, eyelids, eyebrows, nose shape, lips, jawline, chin, cheek structure, skin texture, hairline, hairstyle, hair texture, body proportions, physique, shoulder width, neck structure, arm proportions, hand shape, posture tendencies, and all unique physical characteristics.
+
+Do NOT redesign, beautify, enhance, stylize, or modify the person's facial structure or body shape. Do NOT add cheekbones, stronger jawline, or any facial enhancements. Keep the face and body anatomically true to the reference photo.
+
+Identity comes exclusively from the reference photo. Expression, pose, and scene styling come exclusively from the template image.
+
+The facial expression is extremely important.
+
+Precisely recreate the exact emotional state from the template image: cold, emotionless, dominant, highly controlled, intimidating calmness, and complete emotional suppression.
+
+Match the exact eye direction, gaze intensity, eyelid tension, brow tension, jaw tension, mouth neutrality, head angle, head rotation, head tilt, and facial muscle rigidity.
+
+There must be no smile, no warmth, no friendliness, no visible emotion. The expression should remain rigid, calm, cold, and dominant.
+
+The eyes are critical. Recreate the same cold, fixed, forward-facing stare with minimal emotion and maximum psychological intensity.
+
+Transfer the entire body and pose from the template image, including shoulders, torso, arms, hands, body angle, and motorcycle riding posture. Reconstruct the body using the reference person's true body proportions and anatomy while adapting naturally to the scene perspective.
+
+The head rotation, body position, and posture must match the template image exactly while preserving the reference person's identity.
+
+Do not perform a face swap or body paste. Reconstruct the entire person naturally inside the scene.
+
+The inserted person must look physically present in the original scene, not composited, pasted, or edited.
+
+Strong scene adaptation is required:
+- match exact lighting direction
+- match shadow placement on face and body
+- match warm cinematic lighting
+- match contrast and exposure
+- match reflections on sunglasses and jacket
+- match perspective and lens compression
+- match depth of field and focus plane
+
+Apply the same skin rendering, shadow structure, color grading, cinematic contrast, image texture, and gritty film-like visual style as the template image.
+
+Keep the motorcycle, sunglasses, leather jacket, hand positions, camera angle, framing, environment, lighting setup, and composition unchanged.
+
+Do not modify the background, motorcycle, environment, or image composition.
+
+Photorealistic, physically accurate integration, realistic anatomy, realistic skin texture, seamless integration, cinematic realism, premium film-quality result.`
+
+const TERMINATOR_2 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+Identity preservation is the absolute top priority.
+
+The reference photo is the only source of identity, face, body, and physical appearance. Preserve the exact facial identity and body characteristics of the reference person with maximum fidelity.
+
+Keep exact face shape, facial proportions, facial structure, bone structure, eye shape, eyelids, eyebrows, nose shape, nostrils, lips, mouth shape, jawline, chin, cheek structure, skin texture, skin pores, facial asymmetry, hairline, hairstyle, hair texture, body proportions, physique, shoulder width, neck structure, arm proportions, hand shape, posture tendencies, and all unique physical characteristics.
+
+Do NOT redesign, beautify, stylize, enhance, sculpt, or modify facial anatomy or body shape. Do NOT add cheekbones, stronger jawline, sharper facial structure, or heroic body proportions. Keep the person anatomically true to the reference photo.
+
+Identity comes exclusively from the reference photo. Expression, pose, and scene styling come exclusively from the template image.
+
+The facial expression is extremely important.
+
+Precisely recreate the exact emotional state from the template image: cold, emotionless, dominant, highly controlled, intimidating calmness, and complete emotional suppression.
+
+Match the exact eye direction, gaze intensity, eyelid tension, brow tension, facial muscle rigidity, jaw tension, mouth neutrality, head angle, head rotation, head tilt, and psychological presence.
+
+There must be no smile, no warmth, no friendliness, no softness, and no visible emotion. The expression must remain rigid, calm, cold, and dominant.
+
+The eyes are critical. Recreate the same cold, fixed, intimidating stare with minimal emotion and maximum psychological intensity.
+
+Transfer the entire body and pose from the template image, including shoulders, torso, arms, hands, body angle, stance, and full-body posture. Reconstruct the body using the reference person's true body proportions and anatomy while adapting naturally to the scene perspective.
+
+The head rotation, body position, stance, and posture must match the template image exactly while preserving the reference person's identity.
+
+Do not perform face swap or body paste. Reconstruct the entire person naturally inside the scene.
+
+The inserted person must look physically present in the original scene, not composited, pasted, or edited.
+
+Strong scene adaptation is required:
+- match exact lighting direction
+- match warm hard backlight from the right side
+- match shadow placement on face and body
+- match bright highlights and deep shadows
+- match cinematic contrast and exposure
+- match reflections on sunglasses, weapon, and leather jacket
+- match perspective and lens compression
+- match depth of field and focus plane
+
+Apply the same skin rendering, shadow structure, color grading, cinematic contrast, image texture, warm highlights, and gritty film-like 90s action movie visual style as the template image.
+
+Keep the weapon, sunglasses, leather jacket, hand position, camera angle, framing, environment, lighting setup, and composition unchanged.
+
+Do not modify the background, environment, objects, or image composition.
+
+Photorealistic, physically accurate integration, realistic anatomy, realistic skin texture, seamless integration, cinematic realism, premium film-quality result.`
+
+const TERMINATOR_3 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+Identity preservation is the absolute top priority.
+
+The reference photo is the only source of identity, face, body, and physical appearance. Preserve the exact facial identity and body characteristics of the reference person with maximum fidelity.
+
+Keep exact face shape, facial proportions, facial structure, bone structure, eye shape, eyelids, eyebrows, nose shape, nostrils, lips, mouth shape, jawline, chin, cheek structure, skin texture, skin pores, facial asymmetry, hairline, hairstyle, hair texture, body proportions, physique, shoulder width, neck structure, arm proportions, hand shape, posture tendencies, and all unique physical characteristics.
+
+Do NOT redesign, beautify, stylize, enhance, sculpt, or modify facial anatomy or body shape. Do NOT add cheekbones, stronger jawline, sharper facial structure, or heroic body proportions. Keep the person anatomically true to the reference photo.
+
+Identity comes exclusively from the reference photo. Expression, pose, and scene styling come exclusively from the template image.
+
+The facial expression is the highest priority after identity preservation.
+
+Precisely recreate the exact emotional state from the template image: cold, emotionless, dominant, rigid, highly controlled, intimidating calmness, and complete emotional suppression.
+
+Match the exact eye direction, fixed stare, gaze intensity, eyelid tension, brow tension, facial muscle rigidity, jaw tension, mouth rigidity, lip compression, head angle, head rotation, head tilt, and psychological presence.
+
+There must be no smile, no warmth, no friendliness, no softness, and no visible emotion. The expression must remain rigid, calm, cold, dominant, and machine-like.
+
+The eyes are the most important element. Recreate the same cold, fixed, emotionless stare with maximum psychological intensity and zero emotional warmth.
+
+Transfer the entire body and pose from the template image, including shoulders, torso, neck, posture, and body stance. Reconstruct the body using the reference person's true body proportions and anatomy while adapting naturally to the scene perspective.
+
+The head rotation, body position, stance, and posture must match the template image exactly while preserving the reference person's identity.
+
+Do not perform face swap or body paste. Reconstruct the entire person naturally inside the scene.
+
+The inserted person must look physically present in the original scene, not composited, pasted, or edited.
+
+Strong scene adaptation is required:
+- match exact lighting direction
+- match shadow placement on face and body
+- match high contrast sunlight
+- match warm highlights and cool shadows
+- match cinematic contrast and exposure
+- match reflections on sunglasses and leather jacket
+- match perspective and lens compression
+- match depth of field and focus plane
+
+Apply the same skin rendering, shadow structure, color grading, cinematic contrast, image texture, warm highlights, and gritty action-movie visual style as the template image.
+
+Keep the sunglasses, leather jacket, body posture, camera angle, framing, environment, lighting setup, and composition unchanged.
+
+Do not modify the background, environment, objects, or image composition.
+
+Photorealistic, physically accurate integration, realistic anatomy, realistic skin texture, seamless integration, cinematic realism, premium film-quality result.`
+
+// ── The Fast and the Furious ──
+
+const THEFAST_1 = `Replace only the man on the right side with the person from the uploaded reference photo.
+
+Do not modify the man on the left side, the cars, the background, lighting, or camera framing.
+
+The original right-side person must be completely removed.
+
+Perform a full-body reconstruction, not a face swap and not a partial edit.
+
+The new person must be fully reconstructed from the reference photo including face, head, hair, neck, shoulders, chest, torso, waist, hips, arms, legs, and full anatomical body structure.
+
+The reference photo defines identity, body proportions, height, and physique.
+
+The pose must match the original right-side subject (arms crossed, stance, body orientation).
+
+IMPORTANT: The person must be reconstructed in full physical form (full body exists in the scene), but the camera framing must remain identical to the original image.
+
+This means:
+- do NOT change the camera angle
+- do NOT zoom out
+- do NOT reframe the image
+- do NOT reveal additional body parts beyond the original crop
+
+If the original image crops the legs, the new person must also be naturally cropped at the same level by the camera framing. The cropping is a result of the camera, not the body design.
+
+The body must remain anatomically correct and uncompressed. Do not shrink or force-fit the person into the frame.
+
+Clothing must adapt naturally to the reference body proportions (black t-shirt, jeans).
+
+Facial identity must remain identical to the reference photo without any structural changes.
+
+Expression must match the original subject: calm dominance, serious controlled emotion, minimal facial movement, no smile.
+
+Strong scene integration:
+- match nighttime street lighting
+- match warm street light direction and intensity
+- match shadow placement and softness
+- match reflections from cars
+- match cinematic contrast and exposure
+- match lens compression and depth of field
+
+Lighting must wrap naturally around face and body with physically correct shadows and bounce light.
+
+The inserted person must look like they were originally photographed in this exact scene, not composited or pasted.
+
+Photorealistic, physically accurate integration, seamless replacement, cinematic realism.`
+
+const THEFAST_2 = `Replace only the man sitting in the foreground on the left side (wearing the light blue shirt and sunglasses) with the person from the uploaded reference photo.
+
+Do not modify the man sitting on the right side, the car interior, lighting, background, or camera framing.
+
+The original left-side man must be completely removed and fully replaced.
+
+Perform a full-body reconstruction, not a face swap and not a partial edit.
+
+The new person must be fully reconstructed from the reference photo including face, head, hair, neck, shoulders, chest, torso, arms, hands, legs, and full body proportions.
+
+HIGHEST PRIORITY: identity fidelity (critical requirement)
+The face must be reconstructed with extreme precision from the reference photo:
+- exact facial structure and bone geometry
+- exact eye shape, eyelids, iris placement, gaze depth
+- exact nose structure, nostrils, bridge width and profile
+- exact lip shape, volume, and mouth structure
+- exact jawline, chin shape, cheekbone structure
+- exact skin texture, pores, and micro-details
+- exact facial asymmetry and unique imperfections
+- exact hairstyle, hairline, hair density, and hair texture
+
+Do NOT alter, beautify, stylize, or reinterpret the face in any way.
+Do NOT enhance jawline, cheekbones, symmetry, or masculinity/femininity.
+The identity must match the reference photo 1:1.
+
+Identity, facial features, body proportions, and physique must come exclusively from the reference photo.
+
+IMPORTANT: preserve original seated position and framing exactly.
+The person must remain seated in the front-left seat of the car.
+
+IMPORTANT: legs must remain partially out of frame as in the original composition.
+Do not force full-body visibility. Do not reframe the shot.
+
+The body must remain anatomically correct and naturally seated:
+- correct hip placement on seat
+- correct torso leaning angle
+- correct shoulder relaxation in seated posture
+- correct arm placement and interaction with seat position
+- correct head height relative to car roof and window line
+
+Clothing must adapt naturally to the reference body without changing style.
+
+Expression must match the original scene: calm, serious, controlled, confident, minimal emotion, no smile.
+
+Lighting and realism requirements:
+- match strong direct sunlight direction
+- match hard facial shadows and highlights
+- match sunglasses reflections
+- match car interior shadow occlusion
+- match cinematic contrast and color grading
+- match lens compression and depth of field
+
+The inserted person must look like they were originally photographed in this exact scene, not composited or pasted.
+
+Photorealistic, physically accurate full-body seated replacement with perfect identity preservation and seamless integration.`
+
+const THEFAST_3 = `Replace only the target person with the person from the uploaded reference photo.
+
+Do not modify background, environment, camera angle, composition, or other people.
+
+The original person must be completely removed and fully replaced.
+
+Perform a full-body reconstruction, not a face swap and not a partial edit.
+
+The entire identity must come from the reference photo:
+face, head, neck, body, proportions, posture, and clothing adapted naturally to body shape.
+
+CRITICAL REQUIREMENT: match scene lighting exactly (shadow-driven realism)
+
+Carefully analyze the reference scene lighting and replicate it physically on the inserted person.
+
+The lighting on the subject must match the scene in a physically correct way:
+- replicate exact shadow direction visible in the reference scene
+- replicate shadow softness/hardness exactly as in the scene
+- replicate facial shadow structure (eye sockets, nose shadow, cheek planes, jaw shadow)
+- replicate neck-to-chin shadow transition exactly
+- replicate body shadow falloff consistent with environment lighting
+- replicate ambient occlusion in clothing folds and under arms
+
+IMPORTANT: do NOT apply generic lighting.
+You must reconstruct the same lighting pattern seen in the scene and map it onto the new person.
+
+CRITICAL: eliminate “photoshop cutout effect”
+
+The subject must NOT look pasted or overlaid.
+
+To avoid this:
+- face, neck, and body must share the same continuous shadow system
+- no brightness mismatch between face and body
+- no separately lit face layer
+- no artificial smoothing or beautification of skin
+
+The person must appear as if originally photographed in the scene under the same lighting conditions.
+
+Body integration requirements:
+- correct scale and perspective
+- correct stance and weight distribution
+- natural contact shadows with ground and objects
+
+Identity preservation (strict):
+- keep exact facial structure from reference photo
+- do not modify facial features to match scene
+- do not stylize or reinterpret identity
+
+Expression:
+- neutral / natural expression consistent with scene context
+- no artificial smile unless present in reference
+
+Photorealistic, physically accurate full-body replacement with correct scene-based shadow transfer and seamless cinematic integration.`
+
+// ── Mamma Mia! ──
+
+const MAMMAMIA_1 = `Replace only the target woman in the image with the person from the uploaded reference photo.
+
+Do not modify background, lighting, camera angle, composition, or any other elements.
+
+The original woman must be completely removed and fully replaced.
+
+Perform a FULL-BODY replacement ONLY (not face swap, not head swap, not partial edit).
+
+CRITICAL REQUIREMENT: full person transfer
+The entire person must be reconstructed from the reference photo as one coherent entity:
+face, head, hair, neck, shoulders, torso, arms, hands, legs, full body, proportions, and physique.
+
+════════════════════════════════════
+POSE LOCK (HIGHEST PRIORITY)
+════════════════════════════════════
+Match the exact pose of the scene subject:
+- body orientation
+- seated posture
+- arm and hand positions
+- leg positioning
+- head tilt and rotation
+- spine alignment and weight distribution
+
+════════════════════════════════════
+EMOTION LOCK (ABSOLUTE PRIORITY)
+════════════════════════════════════
+The facial expression MUST be an exact reproduction of the reference scene emotion.
+
+This is not a general emotion description — it is a precise facial-state transfer.
+
+The following must be identical to the reference scene:
+- exact gaze direction and eye focus
+- exact eyelid openness and tension
+- exact eyebrow position and muscle activation
+- exact mouth shape (lip compression, relaxation, symmetry)
+- exact jaw tension and facial muscle tone
+- exact emotional intensity and psychological state
+
+IMPORTANT:
+Do NOT reinterpret the emotion.
+Do NOT “approximate” expression.
+Do NOT soften or enhance facial emotion.
+
+The expression must be copied as a precise facial configuration identical to the reference scene subject.
+
+════════════════════════════════════
+FULL BODY CONSISTENCY
+════════════════════════════════════
+The entire body must come from the reference person:
+- anatomy
+- proportions
+- posture tendencies
+- natural balance and joint behavior
+
+════════════════════════════════════
+LIGHTING INTEGRATION
+════════════════════════════════════
+- continuous lighting across face and body
+- physically correct shadows
+- consistent exposure and skin tone
+- no cutout effect
+- no pasted face appearance
+
+Identity must remain strictly from reference photo with no alteration.
+
+Photorealistic, full-body, physically accurate replacement with exact pose and exact emotion replication.`
+
+const MAMMAMIA_2 = `Replace only the target woman in the image with the person from the uploaded reference photo.
+
+Do not modify background, architecture, lighting setup, camera angle, composition, or any other elements.
+
+The original woman must be completely removed and fully replaced.
+
+Perform a FULL-BODY replacement ONLY (not face swap, not head swap, not partial edit).
+
+════════════════════════════════════
+CRITICAL: COMPLETE HUMAN TRANSFER
+════════════════════════════════════
+The entire person must be reconstructed from the reference photo as a single coherent identity:
+face, head, hair, neck, shoulders, torso, arms, hands, legs, full body, proportions, posture, and physique.
+
+Do NOT:
+- reuse original body
+- mix identities
+- replace only face or head
+- distort proportions to fit scene
+
+The person must be transferred as a complete anatomical entity.
+
+════════════════════════════════════
+POSE LOCK (EXACT MATCH REQUIRED)
+════════════════════════════════════
+Match exactly the pose of the original woman:
+- seated posture and body orientation
+- arm placement and hand position
+- leg positioning and relaxation
+- head tilt and rotation
+- spine alignment and natural balance
+- interaction with environment (support surfaces, railing, ground contact)
+
+Pose must be identical, not approximate.
+
+════════════════════════════════════
+EMOTION LOCK (ABSOLUTE 1:1 REPLICATION)
+════════════════════════════════════
+The facial expression must be an exact replication of the reference scene emotion, INCLUDING a subtle natural light smile.
+
+Must match precisely:
+- eye direction, gaze, and focus
+- eyelid openness and micro-tension
+- eyebrow position and muscle activation
+- mouth shape and lip curvature
+- lip corner elevation (subtle, natural)
+- cheek muscle activation consistent with light smile
+- jaw relaxation and facial tone
+- overall emotional state and mood impression
+
+CRITICAL RULES:
+- Do NOT reinterpret emotion
+- Do NOT amplify or reduce smile intensity
+- Do NOT convert expression to neutral or exaggerated smile
+- Do NOT beautify or stylize emotion
+- Do NOT average facial expression
+
+The emotion must be transferred as a frozen, exact facial-state copy of the reference scene.
+
+════════════════════════════════════
+FULL BODY CONSISTENCY
+════════════════════════════════════
+- full anatomy from reference person
+- correct proportions and limb structure
+- natural seated weight distribution
+- realistic interaction with environment
+- physically plausible joint behavior
+
+════════════════════════════════════
+LIGHTING INTEGRATION (NO CUTOUT EFFECT)
+════════════════════════════════════
+- single coherent lighting system across face, neck, body
+- correct sun direction and shadow geometry
+- continuous shadow flow face → neck → torso → legs
+- correct ambient bounce from stone walls and blue interior
+- consistent exposure and skin tone across entire body
+
+CRITICAL:
+Eliminate any sign of compositing:
+- no pasted face look
+- no brightness mismatch
+- no edge halos
+- no separate lighting layers
+- no “photoshopped overlay” appearance
+
+════════════════════════════════════
+IDENTITY PRESERVATION (STRICT)
+════════════════════════════════════
+Identity must remain exactly from reference photo:
+- no facial modification
+- no body reshaping
+- no beautification
+- no stylization
+- no identity blending
+
+Photorealistic full-body replacement with exact pose transfer, exact emotion replication (including subtle smile), and physically correct lighting integration.`
+
+const MAMMAMIA_3 = `Replace only the main subject in the image using the provided reference photo as the identity source. Fully reconstruct the person from the reference (face, hair, skin tone, body proportions, physique) while preserving the exact original pose, posture, gaze direction, facial expression, and hand placement in the scene.
+
+The result must be strictly anatomically correct and physically consistent. Enforce correct human biomechanics: naturally aligned spine, stable and realistic neck posture (no bending, tilting, or stretching artifacts), correct shoulder and clavicle structure, and balanced body weight distribution consistent with standing pose on an unstable surface (boat). Head-to-neck transition must be smooth and anatomically plausible.
+
+Hands and fingers are the highest priority: ensure exactly five fingers per hand, correct phalange structure, proper joint articulation, realistic tendon-driven curvature, and physically correct grip mechanics. No distortions, no fused fingers, no missing digits, no extra digits, no unnatural bending angles.
+
+Integrate the subject as if originally captured in-camera within the scene. Apply accurate environmental interaction: correct contact shadows on the boat, natural occlusion under fingers and feet, and physically correct light wrapping across face, neck, and clothing.
+
+Match cinematic golden-hour Mediterranean lighting with realistic directional sunlight, soft shadow gradients, and subtle reflected light from water affecting lower body and facial shading. Maintain realistic skin micro-texture and subsurface scattering without plastic smoothing or over-processing.
+
+Preserve all camera parameters (framing, lens, depth of field, composition, background, environment) exactly as in the original image. Ensure seamless photorealistic blending so the subject is indistinguishable from an original capture.`
+
+// ── Rambo ──
+
+const RAMBO_1 = `Replace only the motorcycle rider with the person from the uploaded reference photo.
+
+Do not change the motorcycle, road, police car, forest, lighting, camera angle, framing, perspective, or background.
+
+Fully remove the original rider. Rebuild the uploaded person from scratch in the same place and pose. This is NOT a face swap, NOT a head swap, and NOT a pasted Photoshop edit.
+
+The uploaded person must replace the rider completely:
+face, head, hair, neck, shoulders, torso, arms, hands, legs, body proportions, physique, and full anatomy.
+
+Preserve the uploaded person’s identity and body type exactly. Do not mix facial features, body shape, muscles, skin tone, or proportions with the original rider. Do not inherit the original rider’s physique.
+
+The body must be anatomically correct and proportional:
+natural head-to-body ratio, correct neck connection, correct shoulders, torso, arms, hands, hips, legs, and spine alignment. No oversized head, no tiny head, no twisted neck, no stretched limbs, no impossible anatomy.
+
+Recreate the same motorcycle riding pose exactly:
+same forward torso lean, shoulder angle, elbow bend, wrist rotation, hand placement, grip on handlebars, hip position, knee position, body tension, and riding balance.
+
+If the uploaded person’s head is originally in another angle, naturally rotate and reconstruct the head to match the scene angle while preserving identity. Do not paste the face flat onto the body.
+
+Facial expression and emotion are mandatory:
+the uploaded person must reproduce the exact same intense determined emotion as the reference rider. Match the focused stare, gaze direction, eyebrow tension, eye openness, mouth shape, jaw tension, cheek tension, forehead tension, and overall facial muscle activation. Do not keep the uploaded photo’s original expression. Do not neutralize, soften, smile, or invent another emotion.
+
+Hands must be anatomically correct:
+exactly five fingers on each hand, correct joints, natural thumb placement, realistic grip around handlebars, no fused fingers, no missing fingers, no extra fingers.
+
+Keep the scene clothing style exactly:
+same tank top, pants, fabric folds, wrinkles, and natural interaction with the body and motorcycle.
+
+Integrate the person naturally into the scene:
+match sunlight direction, facial shadows, body shadows, highlights, road bounce light, forest ambient light, exposure, contrast, color temperature, and skin shading. The face, neck, and body must share one continuous lighting system.
+
+The person must have real depth and volume, not look flat. Add natural shadows on the face, under the jaw, on the neck, arms, torso, and where the body contacts the motorcycle.
+
+No Photoshop look:
+no pasted face, no pasted head, no pasted body, no cutout edges, no halos, no lighting mismatch, no compositing artifacts.
+
+Final result must look like a real original photograph of the uploaded person riding the motorcycle in this exact scene, with exact pose, proportional anatomy, correct head size, exact intense emotion from the reference, and seamless lighting integration.`
+
+const RAMBO_2 = `Replace only the man in the reference image with the person from the uploaded reference photo.
+
+Do not change the waterfall, rocks, bow, quiver, clothing, lighting, camera angle, framing, perspective, background, or composition.
+
+Completely remove the original man. Recreate the uploaded person from scratch in exactly the same place. This is NOT a face swap, NOT a head swap, and NOT a Photoshop cut-and-paste.
+
+The uploaded person must replace the original character completely:
+face, head, hair, neck, shoulders, torso, arms, hands, legs, body proportions, physique, and full anatomy.
+
+Preserve the uploaded person's identity exactly. Do not mix facial features, body shape, muscles, skin tone, or proportions with the original character. Keep the uploaded person's natural physique and body proportions. Do not inherit the muscular build of the reference character.
+
+The body must be anatomically correct and proportional:
+natural head-to-body ratio, realistic neck connection, shoulders, torso, spine, arms, hips, legs, and hands. No oversized head, no undersized head, no twisted neck, no stretched limbs, and no impossible anatomy.
+
+Recreate the reference pose exactly:
+same body orientation, torso rotation, shoulder angle, head angle, gaze direction, arm position, elbow bend, wrist rotation, hand placement on the bow, leg position, stance, balance, and overall posture.
+
+If the uploaded person's head is facing another direction, naturally reconstruct and rotate it to match the reference while preserving 100% of the uploaded person's identity. Never paste the face onto another body.
+
+Facial expression and emotion are mandatory:
+the uploaded person must reproduce exactly the same serious, determined, intense expression as the reference. Match the gaze direction, eye openness, eyebrow tension, mouth shape, jaw tension, cheek tension, forehead tension, and overall facial muscle activation. Keep the uploaded person's facial features unchanged, but transfer the emotion completely from the reference.
+
+Hands must be anatomically correct:
+exactly five fingers on each hand, correct anatomy, natural joints, realistic grip on the bow, no fused fingers, no missing fingers, and no extra fingers.
+
+Keep the clothing, bow, quiver, straps, pants, and all equipment exactly as shown in the reference. Preserve the same fabric, folds, wrinkles, textures, and natural interaction with the body.
+
+Integrate the uploaded person naturally into the scene:
+match the sunlight direction, waterfall reflections, highlights, facial shadows, body shadows, ambient lighting, exposure, contrast, color temperature, skin shading, and moisture reflections. The face, neck, and body must share one consistent lighting system.
+
+The person must have realistic depth and volume, with natural shadows under the chin, neck, shoulders, arms, torso, and realistic contact shadows where the straps, clothing, quiver, and equipment touch the body.
+
+The result must never look like Photoshop:
+no pasted face, no pasted head, no pasted body, no cutout edges, no halos, no lighting mismatch, and no compositing artifacts.
+
+The final image must look like a real original photograph in which the uploaded person is naturally standing in front of the waterfall in this exact pose, with correct anatomy, proportional body, seamless lighting integration, and exactly the same pose, gaze, head angle, and intense emotion as the reference.`
+
+const RAMBO_3 = `Replace only the main person in the image with the person from the uploaded reference photo.
+
+Use the reference photo as the source of the person's identity, facial features, hairstyle, skin tone, body shape, body proportions, physique, shoulder width, neck shape, posture characteristics, and overall appearance.
+
+Do not perform a face swap. Do not keep any facial features, body proportions, anatomy, or physique from the original subject. Reconstruct the complete person from the reference photo in the exact pose, posture, body language, gaze direction, expression, and attitude of the template subject.
+
+Match the exact cinematic lighting, harsh action color grading, skin texture under extreme conditions, facial contours, highlights, deep shadows, and intense military or jungle atmosphere of the template image.
+
+The inserted person should appear naturally photographed within the scene, not composited or edited. Preserve realistic facial volume, realistic shadow transitions, realistic skin texture under harsh directional lighting, and seamless integration.
+
+Keep the exact pose, hand placement, body posture, camera angle, framing, background, environment, depth of field, and composition unchanged. Preserve the raw cinematic tension, gritty action composition, and the visual quality characteristic of the Rambo franchise.
+
+Do not modify the background, environment, weapons, props, or lighting setup.
+
+Photorealistic, seamless integration, realistic anatomy, natural skin texture, realistic shadows, realistic facial structure, cinematic photography, high detail, gritty action-film atmosphere, premium film-quality realism.`
+
+const WORLD_1 = `Replace the two original characters in the indoor cinematic scene with the exact people from the provided reference images using complete identity transfer and seamless photorealistic integration. Preserve the exact composition, framing, emotional tension, body positioning, and intimate face-to-face interaction from the original image. The final result must look like a real cinematic movie still captured naturally in-camera. Left side — male replacement: Completely replace the original young man with the man from the male reference image. Transfer exactly: face structure jawline and cheekbones nose shape lips and mouth structure authentic neutral / emotionally tense expression from the reference eyes and natural eye intensity hairstyle and hair texture hair color skin tone and realistic skin texture neck proportions body proportions posture and subtle body tension clothing style adaptation overall masculine identity and realistic human presence Keep the exact original pose: standing face-to-face with the girl same shoulder angle same head tilt same eye-line direction same body distance and emotional tension same cinematic side profile orientation Right side — female replacement: Completely replace the original young woman with the woman from the female reference image. Transfer exactly: facial structure eyes and authentic emotional gaze eyebrows lips and natural mouth tension realistic neutral cinematic expression from the reference hairstyle and natural hair flow hair color skin tone and skin pores body proportions posture clothing adaptation overall identity and feminine presence Keep the exact original pose: standing directly in front of the male character same body angle same head position same eye contact intensity same relaxed arm placement same cinematic side-profile orientation Critical emotional realism requirements: Both characters must preserve authentic human emotional realism from the reference photos: natural eyes believable facial muscles realistic micro-expressions subtle emotional tension relaxed mouth anatomy authentic cinematic mood natural human presence Scene preservation requirements: Preserve completely: indoor room environment large window background dark forest outside warm cinematic lamp lighting evening atmosphere shallow depth of field cinematic framing realistic indoor reflections ambient warm shadows realistic room perspective moody natural color grading Lighting and integration requirements: Perfectly match: warm indoor tungsten lighting soft cinematic shadows window backlight realistic skin shading facial shadow transitions room ambient bounce light camera perspective focal length compression realistic depth of field film-like cinematic grading natural exposure balance Extremely important anatomy requirements: anatomically correct hands correct number of fingers no extra fingers no fused fingers no duplicated limbs realistic shoulders realistic neck connection natural torso proportions physically correct posture realistic arm placement accurate body balance natural head perspective proper facial symmetry realistic ears and jaw anatomy Ensure: invisible edit quality seamless compositing natural interaction between both people physically believable proximity realistic skin pores natural fabric folds cinematic realism realistic eye reflections natural human anatomy perfect environmental integration Ultra photorealistic cinematic DSLR movie still, highly detailed skin texture, realistic anatomy, emotionally authentic expressions, moody cinematic lighting, natural indoor atmosphere, shallow depth of field, seamless identity replacement, invisible compositing quality. Negative prompt: extra fingers, extra hands, fused fingers, duplicated limbs, malformed anatomy, broken arms, distorted face, asymmetrical eyes, warped jaw, unrealistic expression, fake emotion, artificial smile, dead eyes, incorrect gaze, floating body parts, bad anatomy, stiff posture, unnatural neck, distorted shoulders, bad perspective, mismatched lighting, poor compositing, pasted subject, CGI, 3D render, cartoon, anime, illustration, painting, wax skin, plastic texture, blurry details, low quality, oversaturated colors, unrealistic shadows, distorted proportions, watermark, text, logo`;
+
+const WORLD_2 = `Replace the two original characters in the cinematic car interior scene with the exact real people from the provided reference photos using highly accurate identity transfer and seamless photorealistic compositing. Female on the left: Replace the original blonde girl with the woman from the female reference image. Preserve her exact facial identity: face shape, jawline, cheekbones, eyes, eyebrows, nose, lips, natural expression, skin tone, skin texture, hairline, hairstyle, brunette hair texture, neck proportions, and realistic feminine features. Keep her exact original pose, side-profile angle, head tilt, shoulder position, eye-line, seated posture, and intimate emotional tension. Male on the right: Replace the original male character with the man from the male reference image. Preserve his exact identity: facial structure, jawline, eyes, eyebrows, nose, lips, realistic neutral expression, skin texture, messy dark hairstyle, masculine proportions, and natural facial asymmetry. Keep the exact original pose, leaning posture, arm placement, profile angle, eye contact direction, and cinematic tension. Identity fidelity is the highest priority. The characters must look unmistakably like the real people from the references, not generic AI approximations. Preserve natural asymmetry, realistic facial muscles, authentic eyes, subtle imperfections, and human emotional realism. Avoid beautification or “AI-face” appearance. Preserve the original cinematic composition completely: old car interior, dashboard, rear-view mirror, windshield background, daylight environment, shallow depth of field, realistic reflections, film-like cinematic color grading, soft natural lighting, realistic perspective, and authentic movie still atmosphere. Perfect lighting integration: natural daylight through windows, realistic skin shading, ambient bounce light, soft shadows, accurate exposure, realistic reflections, physically believable compositing. Ultra photorealistic cinematic DSLR movie still, realistic skin pores, natural anatomy, invisible edit quality, seamless integration, emotionally authentic expressions. Negative prompt: generic AI face, weak likeness, low identity accuracy, beautified face, uncanny valley, fake skin, plastic texture, distorted anatomy, extra fingers, fused fingers, duplicated limbs, warped face, asymmetrical eyes, unrealistic expression, bad perspective, mismatched lighting, CGI render, cartoon, blurry details, overprocessed image, unrealistic shadows, deformed hands, stretched anatomy, bad compositing, low quality.`;
+
+const WORLD_3 = `Use the original diner frame as the immutable master shot. Perform an ultra-precise photorealistic identity transfer of the two seated characters using the supplied real-person references. Preserve exact facial identity with maximum fidelity. The final image must look indistinguishable from a real DSLR cinematic still from an indie coming-of-age film.
+
+CRITICAL RULE:
+Do NOT reinterpret the faces.
+Do NOT stylize.
+Do NOT beautify.
+Do NOT average facial features.
+Do NOT generate “similar-looking” people.
+The generated people must be unmistakably the exact same individuals from the reference photos.
+
+SCENE LOCK:
+Keep the diner scene completely unchanged:
+same framing,
+same composition,
+same camera height,
+same lens perspective,
+same crop,
+same table geometry,
+same wall decorations,
+same lighting,
+same warm tungsten diner atmosphere,
+same depth of field,
+same cinematic grain,
+same shadows,
+same facial lighting direction,
+same body proportions,
+same physical positioning.
+
+Only replace identity and clothing while preserving the original shot exactly.
+
+IDENTITY PRESERVATION — EXTREMELY IMPORTANT:
+Transfer exact real facial anatomy from the references:
+exact skull shape,
+exact jawline,
+exact cheekbone structure,
+exact eye shape,
+exact eye spacing,
+exact eyelid form,
+exact nose bridge and tip,
+exact lip shape,
+exact ear shape,
+exact chin,
+exact brow structure,
+exact hairline,
+exact facial asymmetry,
+exact skin texture,
+exact pores,
+exact natural imperfections,
+exact under-eye structure,
+exact facial proportions.
+
+Preserve realistic age appearance.
+Preserve subtle tiredness and emotional realism.
+Maintain natural human asymmetry.
+Do NOT smooth skin.
+Do NOT sharpen unnaturally.
+Do NOT make faces generic or “Instagram attractive.”
+
+The transferred identities must survive even under close zoom inspection.
+
+MALE CHARACTER:
+Use the exact male identity from the reference photo.
+Preserve his introspective, emotionally withdrawn expression.
+Keep the same tired eyes and subtle sadness.
+Maintain the exact original diner pose:
+same seated posture,
+same shoulder angle,
+same torso orientation,
+same head tilt,
+same gaze direction,
+same arm placement,
+same awkward stillness.
+
+Adapt the oversized black hoodie naturally onto the ORIGINAL untouched body and ORIGINAL untouched hands.
+Do not regenerate or reinterpret the arm geometry.
+Preserve the exact sleeve alignment around the existing wrist and hand position.
+
+FEMALE CHARACTER:
+Use the exact female identity from the reference photo.
+Preserve her detached observational gaze and restrained vulnerability.
+Maintain the exact original diner pose:
+same posture,
+same head tilt,
+same eye direction,
+same body language,
+same subtle emotional distance.
+
+Adapt the fitted white short-sleeve shirt and layered silver necklaces naturally onto the ORIGINAL untouched body and ORIGINAL untouched hands.
+Preserve realistic fabric tension, wrinkles, and cloth deformation while keeping the original arm anatomy unchanged.
+
+HANDS — ABSOLUTE PRIORITY:
+DO NOT regenerate the hands.
+DO NOT modify the hand pose.
+DO NOT reinterpret finger anatomy.
+
+Keep the ORIGINAL diner-frame hands completely untouched:
+same fingers,
+same anatomy,
+same contact,
+same overlap,
+same proportions,
+same skin compression,
+same wrist structure,
+same lighting,
+same positioning.
+
+The original hands from the diner frame must remain preserved exactly as photographed.
+
+Only adapt sleeves/clothing around the existing hands and wrists.
+
+ABSOLUTELY FORBIDDEN:
+new hands,
+extra fingers,
+missing fingers,
+fused fingers,
+duplicated thumbs,
+warped wrists,
+twisted anatomy,
+rubber hands,
+floating fingers,
+AI-looking anatomy,
+modified finger positions,
+changed touching interaction,
+different hand proportions.
+
+REALISM:
+True photorealistic skin shading.
+Natural subsurface scattering.
+Invisible compositing.
+Natural film grain.
+Real DSLR texture.
+Subtle cinematic color grading.
+Authentic tungsten diner lighting.
+No CGI appearance.
+No synthetic sharpness.
+No overprocessed skin.
+No beauty filter.
+No artificial symmetry.
+
+NEGATIVE PROMPT:
+generated hands,
+new fingers,
+modified hands,
+AI hands,
+identity drift,
+face reinterpretation,
+beautified face,
+plastic skin,
+airbrushed skin,
+CGI,
+3D render,
+synthetic lighting,
+uncanny valley,
+fashion editorial look,
+TikTok face,
+Instagram face,
+anime features,
+doll face,
+bad anatomy,
+body distortion,
+unnatural pose,
+fake skin texture,
+AI artifacts`;
+
+const STRANGER_1 = `Use the original frame as an immutable master plate. Perform a forensic-grade photorealistic identity replacement of the two standing characters using the supplied real-person references. Preserve 100% of the original cinematography, blocking, lighting, wardrobe behavior, lens characteristics, and emotional tone. Replace ONLY the identities of the humans while maintaining the exact physical performance captured in the source frame.
+
+PRIMARY OBJECTIVE:
+The final image must look as if the referenced real individuals were physically present on set during filming. Identity fidelity is the absolute highest priority.
+
+The result must NOT resemble:
+
+AI-generated “inspired by” faces
+averaged facial features
+beautified reinterpretations
+glamourized actors
+fashion-editorial versions
+synthetic CGI humans
+
+The generated people must immediately and unmistakably match the exact individuals from the references at first glance.
+
+LOCKED MASTER FRAME — DO NOT CHANGE:
+
+exact framing
+exact composition
+exact camera placement
+exact focal length
+exact lens distortion
+exact depth of field
+exact cinematic grain
+exact warm tungsten lighting
+exact room geometry
+exact shadows and bounce light
+exact body proportions
+exact posture tension
+exact clothing silhouette
+exact emotional atmosphere
+exact physical interaction between characters
+
+DO NOT:
+
+alter pose
+alter body language
+alter wardrobe
+alter perspective
+alter lighting direction
+alter facial expression intensity
+stylize the scene
+
+LEFT CHARACTER — EXTREME IDENTITY ACCURACY
+
+Replace the left character ONLY with the young male from the carousel reference.
+
+CRITICAL FACIAL MATCHING REQUIREMENTS:
+
+very narrow vertically elongated face
+slim bone structure
+youthful slightly gaunt appearance
+soft angular jawline without sharp masculinity
+thin pale lips with naturally flattened upper lip
+large sleepy hooded eyes
+melancholic heavy-lidded gaze
+dark brown eyes
+subtle under-eye darkness
+delicate narrow nose bridge
+soft cheek structure with low facial fat
+pale realistic skin
+authentic uneven skin texture
+no makeup appearance
+naturally asymmetrical facial structure
+realistic teenage/young adult proportions
+
+HAIR — MUST MATCH REFERENCE EXACTLY:
+
+messy medium-length dark brown hair
+soft layered texture
+slightly overgrown silhouette
+uneven natural fringe
+loose volume around ears and crown
+realistic strand separation
+non-stylized haircut
+slightly oily natural texture
+no polished salon appearance
+
+EXPRESSION:
+
+emotionally detached
+introspective
+restrained sadness
+distant gaze
+quiet tension
+subtle emotional fatigue
+
+PRESERVE EXACT ORIGINAL PERFORMANCE:
+
+identical neck rotation
+identical eye direction
+identical shoulder angle
+identical crossed-arm placement
+identical torso orientation
+identical body compression
+identical silhouette
+
+WARDROBE:
+Maintain the oversized pale blue collared sweatshirt EXACTLY:
+
+heavy cotton behavior
+realistic fold physics
+sleeve compression
+fabric thickness
+natural draping tension
+authentic cloth shadows
+
+RIGHT CHARACTER — EXTREME IDENTITY ACCURACY
+
+Replace the right character ONLY with the young girl from the outdoor reference.
+
+CRITICAL FACIAL MATCHING REQUIREMENTS:
+
+youthful rounded facial structure
+soft cheeks
+realistic teenage proportions
+large expressive slightly sad eyes
+subtle vulnerable gaze
+naturally thin eyebrows
+delicate small lips
+soft narrow jawline
+pale natural skin tone
+visible realistic pores
+candid non-model appearance
+authentic adolescent facial anatomy
+no beautification
+no adultification
+no glamorization
+
+HAIR — MUST MATCH REFERENCE EXACTLY:
+
+long light-brown hair
+naturally fine hair texture
+subtle waviness
+realistic strand separation
+soft natural volume
+physically accurate warm indoor highlights
+natural imperfect placement
+authentic casual appearance
+
+EXPRESSION:
+
+emotionally vulnerable
+cautious
+protective
+quietly tense
+intimate and emotionally dependent
+
+PRESERVE EXACT ORIGINAL PERFORMANCE:
+
+identical leaning posture
+identical shoulder compression
+identical head position
+identical gaze direction
+identical arm placement
+identical hand placement on sleeve
+identical physical closeness
+
+HANDS — MAXIMUM REALISM PRIORITY
+
+All hands must be anatomically flawless and physically coherent.
+
+MANDATORY:
+
+exactly five fingers per hand
+correct thumb articulation
+accurate finger lengths
+realistic knuckles
+visible tendon structure
+natural nail anatomy
+proper wrist alignment
+believable skin compression
+realistic interaction with fabric
+physically accurate grip pressure
+
+STRICTLY FORBIDDEN:
+
+fused fingers
+duplicated fingers
+extra fingers
+malformed joints
+melted palms
+floating wrists
+warped anatomy
+AI hand artifacts
+rubber-like skin
+
+PHOTOREALISM REQUIREMENTS:
+
+invisible compositing
+DSLR-level realism
+natural sensor grain
+cinematic optical softness
+authentic pore detail
+realistic subsurface scattering
+coherent tungsten lighting
+physically correct skin reflections
+accurate shadow integration
+realistic eye moisture
+natural sclera texture
+physically accurate hair shading
+believable cloth interaction
+filmic contrast response
+subtle cinematic color grading
+absolutely no digital painting appearance
+
+FACE INTEGRATION REQUIREMENTS:
+The replacement faces must inherit:
+
+original scene lighting
+original shadow direction
+original lens softness
+original skin exposure
+original depth-of-field falloff
+original facial perspective
+original head geometry
+
+The identities must feel organically photographed in-camera, not composited afterward.
+
+NEGATIVE PROMPT:
+weak resemblance, identity drift, face averaging, generic AI face, beautified face, fashion model look, influencer appearance, symmetry correction, glamour skin, plastic skin, porcelain skin, over-retouched face, CGI, fake cinematic look, synthetic rendering, stylized humans, uncanny valley, wrong eye shape, wrong jawline, wrong nose bridge, wrong facial proportions, incorrect hairline, incorrect hairstyle, inaccurate expression, pose mismatch, body mismatch, lighting mismatch, compositing artifacts, fake shadows, over-sharpening, artificial detail, anime influence, digital painting texture, malformed anatomy, extra fingers, fused fingers, duplicated limbs, warped wrists, floating hands, melted hands, unrealistic skin, de-aged appearance, artificial perfection`;
+
+const STRANGER_2 = `Use the reference image ONLY as a cinematography, composition, pose, and interaction template.
+
+DO NOT use the original actors as appearance references in ANY way.
+
+The original people are ONLY placeholders for:
+— body positioning
+— pose
+— interaction
+— framing
+— camera angle
+— lighting
+— scene composition
+
+Completely remove all original identities from the final result.
+
+ABSOLUTELY NO blending between uploaded people and original actors.
+
+Do NOT inherit from the reference actors:
+— face shape
+— facial proportions
+— jawline
+— eyes
+— eyebrows
+— nose
+— lips
+— hairstyle
+— skin texture
+— skin color
+— body type
+— physique
+— silhouette
+— hand shape
+— arm shape
+— ethnicity
+— age appearance
+
+CRITICAL:
+This is NOT a face swap.
+
+Do NOT paste uploaded faces onto the original bodies.
+
+Instead:
+fully replace the original actors with the uploaded people as COMPLETE REAL HUMANS naturally existing in the scene.
+
+CRITICAL FULL HUMAN TRANSFER:
+
+Transfer the uploaded people as COMPLETE FULL HUMANS.
+
+NOT just faces.
+NOT just heads.
+NOT facial identity only.
+
+The ENTIRE PERSON must be transferred together as ONE connected human identity.
+
+This includes:
+— head
+— face
+— hair
+— neck
+— shoulders
+— torso
+— arms
+— hands
+— fingers
+— legs
+— body proportions
+— physique
+— silhouette
+— clothing
+— sleeves
+— posture
+— body language
+
+The uploaded person's FULL BODY must replace the original actor's FULL BODY.
+
+Do NOT keep:
+— original hands
+— original arms
+— original body
+— original skin color
+— original physique
+— original clothing fit
+— original body proportions
+
+Do NOT attach the uploaded face onto the original actor’s body.
+
+This is NOT a face swap.
+
+This is a COMPLETE PERSON REPLACEMENT.
+
+The uploaded people must remain physically consistent from head to toe.
+
+Face, hands, arms, neck, and body MUST belong to the SAME uploaded person.
+
+If the uploaded person has:
+— light skin → hands and body must also be light
+— slim physique → body must remain slim
+— specific clothing proportions → preserve them naturally
+
+Do NOT create hybrid humans.
+
+Do NOT mix:
+— uploaded face + original body
+— uploaded face + original hands
+— uploaded face + original skin tone
+
+ZERO identity mixing allowed.
+
+The uploaded person’s:
+— anatomy
+— proportions
+— skin tone
+— body type
+— clothing behavior
+— silhouette
+
+must remain intact across the ENTIRE body.
+
+The uploaded people must remain IDENTICAL to their source photos.
+
+Preserve EXACTLY:
+— facial bone structure
+— jawline
+— eye shape
+— eyelids
+— eyebrows
+— nose shape
+— lip shape
+— cheek structure
+— forehead proportions
+— chin structure
+— ears
+— natural asymmetry
+— hairstyle
+— hairline
+— hair density
+— skin texture
+— skin undertone
+— body proportions
+— shoulder width
+— arm proportions
+— physique
+— silhouette
+
+SKIN CONSISTENCY IS CRITICAL:
+
+If the uploaded person has light skin on the face:
+— hands must also be light
+— arms must also be light
+— neck must also be light
+— all visible skin must perfectly match
+
+There must be ZERO mismatch between:
+— face and hands
+— face and arms
+— face and neck
+— face and body
+
+Do NOT preserve the original actor’s dark hands, arms, or body skin.
+
+The uploaded body must FULLY replace the original body.
+
+Do NOT create:
+— face/body color mismatch
+— different undertones
+— disconnected body parts
+— hybrid identities
+— face-swapped appearance
+— pasted faces
+
+Do NOT:
+— beautify faces
+— smooth anatomy unnaturally
+— sharpen jawlines
+— enlarge eyes
+— slim the body
+— glamorize appearance
+— make them prettier
+— make them model-like
+— stylize skin
+— alter ethnicity
+— alter age appearance
+
+The uploaded people must look like authentic photographed humans physically present in the room.
+
+They must NOT look:
+— pasted
+— composited
+— blended with original actors
+— face-swapped
+— AI-generated
+— uncanny
+— plastic
+— over-retouched
+
+IMPORTANT SCENE STRUCTURE:
+
+Maintain the exact interaction and body positioning:
+— left person remains seated on the left side of the couch
+— right person remains seated on the right side
+— preserve exact handshake position
+— preserve exact hand contact
+— preserve exact eye-lines
+— preserve exact body spacing
+— preserve exact leg positions
+— preserve exact emotional tone and friendliness
+
+Do NOT alter interaction dynamics.
+Do NOT move hands.
+Do NOT rotate bodies differently.
+
+Keep:
+— exact camera angle
+— exact framing
+— exact crop
+— exact perspective
+— exact lens feel
+— exact scene geometry
+— exact subject spacing
+
+Camera position is LOCKED.
+Perspective is LOCKED.
+Composition is LOCKED.
+
+NATURAL SCENE ADAPTATION:
+
+Adapt the uploaded people naturally to the scene WITHOUT changing identity.
+
+Scene adaptation may affect ONLY:
+— lighting integration
+— environmental shadows
+— color grading
+— atmospheric depth
+— depth of field
+— film grain
+— ambient indoor light response
+
+Identity and anatomy must remain untouched.
+
+LIGHTING:
+Match the original warm indoor daylight lighting, soft environmental shadows, realistic skin shading, depth of field, cinematic color grading, and film grain.
+
+Faces, bodies, hands, arms, necks, clothes, and hair must inherit identical scene lighting naturally.
+
+Blend the uploaded people seamlessly into the environment so they appear originally photographed in this exact shot without any identity mixing from the original actors.`;
+
+const STRANGER_3 = `Use the reference image ONLY for:
+— cinematography
+— framing
+— pose
+— body positioning
+— interaction
+— camera angle
+— lighting
+— composition
+— environment
+
+The reference actors are NOT appearance references in ANY way.
+
+FULL CHARACTER REPLACEMENT REQUIRED
+
+Completely remove the original actors’ identities and replace them entirely with the uploaded people as fully coherent real humans.
+
+This is NOT:
+— face swap
+— face blend
+— identity merge
+— actor adaptation
+— resemblance transfer
+
+This IS:
+— complete human replacement
+
+The uploaded people must replace the reference actors from head to toe.
+
+NO IDENTITY LEAKAGE FROM THE REFERENCE ACTORS
+
+Absolutely DO NOT inherit ANY facial or anatomical traits from the reference actors, including:
+— face shape
+— skull structure
+— jawline
+— cheekbones
+— chin
+— nose
+— lips
+— eyes
+— eyelids
+— eyebrow shape
+— forehead proportions
+— ear shape
+— hairstyle
+— hairline
+— skin tone
+— ethnicity
+— age appearance
+— body proportions
+— silhouette
+— physique
+— shoulder width
+— arm structure
+— hand structure
+
+The final people must look EXACTLY like the uploaded people and ZERO like the reference actors.
+
+CRITICAL ANTI-BLENDING RULE
+
+Do NOT reinterpret the uploaded people through the reference actors.
+
+The uploaded people must remain 100% genetically and anatomically themselves.
+
+No hybridization allowed.
+
+Forbidden:
+— uploaded face + reference jaw
+— uploaded eyes + reference nose
+— uploaded skin + reference bone structure
+— uploaded hair + reference silhouette
+— uploaded identity mixed with cinematic actor features
+
+The uploaded identities must remain completely isolated from the reference actors.
+
+FULL HUMAN CONSISTENCY
+
+Each transferred person must remain a single unified human identity across:
+— face
+— neck
+— shoulders
+— torso
+— arms
+— hands
+— fingers
+— body proportions
+— skin texture
+— skin undertone
+— physique
+— clothing fit
+— silhouette
+
+Hands MUST belong to the uploaded person.
+Arms MUST belong to the uploaded person.
+Body MUST belong to the uploaded person.
+
+Do NOT preserve ANY anatomy from the reference actors.
+
+FACIAL ACCURACY IS CRITICAL
+
+Preserve EXACTLY:
+— facial proportions
+— facial asymmetry
+— eye spacing
+— eye shape
+— eyelids
+— eyebrow thickness and curvature
+— nose bridge and tip
+— nostril shape
+— lips and mouth proportions
+— jawline
+— chin structure
+— cheek fullness
+— forehead height
+— ear shape
+— skin texture
+— skin undertone
+— hair density
+— hairstyle
+— hairline
+
+Do NOT beautify.
+Do NOT stylize.
+Do NOT make model-like.
+Do NOT sharpen features.
+Do NOT enlarge eyes.
+Do NOT smooth skin unnaturally.
+
+REFERENCE ACTORS MUST NOT INFLUENCE ATTRACTIVENESS OR FACIAL STRUCTURE.
+
+SCENE LOCK
+
+Keep EXACTLY:
+— camera position
+— lens perspective
+— crop
+— framing
+— pose
+— spacing
+— eyelines
+— head direction
+— emotional tension
+— body language
+
+Left person remains left.
+Right person remains right.
+
+Do NOT rotate faces toward camera.
+Do NOT alter the interaction.
+
+ENVIRONMENTAL INTEGRATION ONLY
+
+Only adapt:
+— lighting
+— atmospheric haze
+— scene grain
+— sunset reflections
+— shadow softness
+— depth of field
+— cinematic color grading
+
+Identity must remain untouched.
+
+The uploaded people must look naturally filmed in-camera in the scene, not composited or face-swapped.
+
+FINAL REQUIREMENT
+
+The final frame must look like:
+a real untouched cinematic photograph of the uploaded people in the reference scene.
+
+NOT:
+— AI blended
+— actor-inspired
+— face swapped
+— identity mixed
+— partially inherited from the reference actors
+— composited
+— synthetic looking`;
+
+const LALALAND_1 = `Use the reference scene ONLY for:
+— composition
+— framing
+— lens perspective
+— camera angle
+— blocking
+— pose logic
+— emotional interaction
+— lighting direction
+— cinematic intimacy
+— environmental depth
+
+Completely remove the original actors.
+
+Rebuild both characters entirely from the uploaded identity photos.
+
+DO NOT:
+— face swap
+— morph with original actors
+— blend identities
+— average faces
+— stylize
+— beautify
+— reinterpret anatomy
+— generate “similar-looking” people
+— inherit facial traits from the reference actors
+
+IDENTITY TRANSFER PRIORITY:
+The final result must preserve the uploaded people with near-photographic identity accuracy.
+
+For BOTH characters preserve exactly:
+— facial bone structure
+— eye shape, size, spacing, and eyelids
+— nose bridge, nostrils, and tip anatomy
+— lip contour and natural asymmetry
+— jawline geometry
+— cheek volume
+— forehead proportions
+— chin shape
+— ear placement
+— skin tone and undertones
+— hair density
+— hairline shape
+— hairstyle texture
+— neck thickness and proportions
+— body proportions
+— apparent age
+
+The generated people must look unmistakably identical to the uploaded photos under cinematic lighting conditions.
+
+CRITICAL:
+Identity consistency is more important than cinematic stylization.
+
+Use the uploaded photos as the ONLY source of facial identity and anatomy.
+
+Do not inherit from the original actors:
+— facial proportions
+— face shape
+— skin texture
+— eye anatomy
+— expressions
+— ethnicity cues
+— facial lighting response
+
+EXPRESSION TRANSFER:
+Recreate ONLY the emotional behavior from the reference scene:
+— same eye direction
+— same conversational focus
+— same subtle intimacy
+— same eyelid openness
+— same eyebrow tension
+— same calm emotional restraint
+— same natural mouth tension
+— same quiet romantic atmosphere
+
+Expressions must feel candid and unposed.
+
+BODY & POSE:
+Preserve:
+— exact body positioning
+— distance between characters
+— head tilt
+— shoulder angles
+— arm placement
+— torso orientation
+— hand interaction
+— body proximity
+— exact framing and crop
+
+But rebuild anatomy using ONLY the uploaded people.
+
+CLOTHING:
+Preserve the elegant cinematic aesthetic of the scene.
+
+Male character:
+— beige tailored jacket
+— white shirt
+— black tie
+— realistic fabric texture
+
+Female character:
+— deep emerald green elegant dress
+— natural fabric folds
+— realistic material response to light
+
+Clothing must fit the uploaded people naturally.
+
+LIGHTING FIX — VERY IMPORTANT:
+The generated faces must be fully integrated into the scene lighting naturally.
+
+Avoid:
+— blown highlights
+— overexposed skin
+— glowing foreheads
+— white patches
+— beauty-light skin
+— HDR look
+— artificial skin smoothing
+— waxy skin
+— hot spots from tungsten lighting
+— mismatched color temperature
+— pasted-on faces
+— synthetic cinematic glow
+
+Lighting must follow:
+— soft warm tungsten practical lighting
+— smooth cinematic shadow gradients
+— physically realistic exposure
+— low-light indoor contrast
+— subtle ambient bounce light
+— natural skin reflectivity only
+— soft rolloff in highlights
+— preserved shadow detail
+— realistic occlusion around eyes, nose, jaw, ears, and hair
+— realistic falloff toward shadow areas
+
+SKIN TEXTURE:
+Preserve:
+— pores
+— small asymmetries
+— natural under-eye texture
+— realistic skin response to warm indoor lighting
+— subtle imperfections
+— authentic skin micro-contrast
+
+Do NOT retouch faces.
+
+IMAGE STYLE:
+Photorealistic cinematic still frame.
+Luxury romantic-drama aesthetic.
+Natural filmic color grading.
+Authentic cinema-camera rendering.
+Shallow depth of field.
+Soft background separation.
+Subtle organic film grain.
+No AI glamour look.
+No hyper-detailing.
+No uncanny symmetry.
+No synthetic beauty filtering.
+No over-sharpening.
+
+The final image must look like a real frame captured on a high-end cinema camera with the uploaded people physically present in the environment.`;
+
+const LALALAND_2 = `Use the reference cinema image STRICTLY AND ONLY for:
+
+— shot composition
+— framing
+— seating geometry
+— camera placement
+— lens compression
+— focal distance
+— pose choreography
+— eye-line interaction
+— lighting direction
+— atmospheric depth
+— cinema environment
+
+The cinema reference image is a PURE STAGING TEMPLATE.
+
+It contributes ZERO identity information.
+
+REMOVE the original actors completely.
+
+NEVER inherit from the cinema actors:
+— face structure
+— attractiveness
+— facial proportions
+— skin
+— ethnicity
+— expressions
+— hairstyle
+— cinematic beauty traits
+— body proportions
+— jawline design
+— eye shape
+— nose shape
+— lips
+— actor aesthetics
+
+==================================================
+PRIMARY OBJECTIVE: EXACT IDENTITY REPLICATION
+==================================================
+
+The uploaded identity photos are NOT inspiration.
+
+They are STRICT BIOMETRIC SOURCES.
+
+The final image must depict EXACTLY the SAME REAL PEOPLE.
+
+NOT:
+— reinterpretations
+— approximations
+— “similar-looking”
+— AI replacements
+— stylized versions
+— cinematic adaptations
+— beauty-enhanced variants
+— generated substitutes
+
+The faces must be INSTANTLY recognizable as the uploaded individuals.
+
+IDENTITY ACCURACY IS MORE IMPORTANT THAN:
+— realism
+— cinematic quality
+— beauty
+— composition
+— mood
+— lighting aesthetics
+
+==================================================
+HARD FACE LOCK — NO DEVIATION
+==================================================
+
+Preserve EXACTLY:
+
+HEAD / SKULL:
+— cranial shape
+— skull dimensions
+— head aspect ratio
+— forehead height
+— forehead curvature
+— temple width
+— occipital contour
+— facial width-to-height ratio
+
+FACE STRUCTURE:
+— cheekbone placement
+— cheek volume
+— jawline geometry
+— mandibular angle
+— chin width
+— chin projection
+— chin curvature
+— neck thickness
+— facial asymmetry
+— natural imbalance
+
+EYES:
+— eye size
+— eye spacing
+— eye depth
+— eye corner angles
+— eyelid anatomy
+— eyelid folds
+— upper lid heaviness
+— lower lid structure
+— iris visibility
+— gaze intensity
+
+EYEBROWS:
+— density
+— thickness
+— spacing
+— asymmetry
+— curvature
+— eyebrow-to-eye distance
+
+NOSE:
+— bridge topology
+— bridge width
+— nose length
+— nose projection
+— nostril anatomy
+— nose tip shape
+— alar geometry
+
+MOUTH:
+— lip volume
+— lip asymmetry
+— cupid bow
+— mouth width
+— philtrum depth
+— natural mouth tension
+
+SKIN:
+— real skin texture
+— pores
+— acne
+— under-eye texture
+— redness
+— natural imperfections
+— skin undertones
+— uneven texture
+
+HAIR:
+— exact hairline
+— density
+— strand direction
+— hairstyle structure
+— texture
+— flyaways
+— natural randomness
+
+EARS:
+— ear size
+— ear angle
+— ear anatomy
+
+==================================================
+STRICT ANTI-BEAUTIFICATION
+==================================================
+
+ABSOLUTELY FORBIDDEN:
+— beautification
+— glamourization
+— face enhancement
+— symmetry correction
+— skin smoothing
+— pore cleanup
+— jaw sharpening
+— eye enlargement
+— lip enhancement
+— nose refinement
+— “cinematic attractiveness”
+— model aesthetics
+— actor aesthetics
+— Instagram-face rendering
+— AI-perfect skin
+— latent face averaging
+— identity blending
+— face morphing
+
+The image must preserve REAL HUMAN imperfections.
+
+==================================================
+IDENTITY SOURCE ISOLATION
+==================================================
+
+Use uploaded photos as the ONLY source for:
+— face
+— anatomy
+— skin
+— ethnicity
+— age
+— proportions
+— hair
+— natural asymmetry
+
+The cinema reference contributes ONLY:
+— composition
+— environment
+— seating layout
+— camera angle
+— lighting setup
+
+NO identity leakage from cinema actors is allowed.
+
+==================================================
+EXPRESSION TRANSFER ONLY
+==================================================
+
+Transfer ONLY:
+— gaze direction
+— conversational tension
+— subtle intimacy
+— head tilt
+— body orientation
+— posture interaction
+
+WITHOUT changing facial anatomy.
+
+Expressions must NEVER distort identity.
+
+==================================================
+REAL PHOTOGRAPHY REQUIREMENT
+==================================================
+
+The final result must look like:
+
+A REAL candid cinema photograph
+of the EXACT uploaded people.
+
+NOT:
+— AI art
+— glamour photography
+— movie poster
+— actor recreation
+— synthetic faces
+— stylized rendering
+
+Natural.
+Unpolished.
+Authentic.
+
+==================================================
+CRITICAL FACE FIDELITY RULE
+==================================================
+
+Even under:
+— shallow DOF
+— cinematic shadows
+— blue ambient lighting
+— partial occlusion
+— perspective distortion
+
+the identities MUST remain fully stable and recognizable.
+
+DO NOT let lighting alter:
+— jaw shape
+— cheek structure
+— eye geometry
+— nose topology
+— facial proportions
+— skin tone
+
+==================================================
+HIGH PRIORITY TECHNICAL DIRECTIVE
+==================================================
+
+Maintain MAXIMUM facial consistency with uploaded references.
+
+Use ultra-high identity preservation.
+
+Avoid:
+— generative reinterpretation
+— latent identity drift
+— automatic beautification
+— cinematic face replacement
+— anatomy hallucination
+
+The uploaded people must remain visually unchanged.
+
+IDENTITY FIDELITY = ABSOLUTE MAXIMUM PRIORITY.`;
+
+const LALALAND_3 = `Use the reference scene ONLY for composition, framing, lens perspective, camera angle, blocking, pose logic, emotional interaction, lighting direction, and environment.
+
+Completely remove the original actors.
+
+Rebuild both characters entirely from the uploaded identity photos.
+
+The uploaded identity photos are the only source of human identity, facial anatomy, body proportions, skin tone, hair, and apparent age.
+
+The reference scene must not influence facial structure, attractiveness, ethnicity, age, or skin texture.
+
+Do not face swap, morph, blend, average faces, stylize, beautify, idealize, or generate similar-looking people.
+
+IDENTITY PRIORITY:
+The final image must look like a real photograph of the exact uploaded people physically present in the scene.
+
+Preserve for both characters:
+— facial bone structure
+— skull shape
+— face proportions
+— eye shape, size, spacing, eyelids, and gaze geometry
+— eyebrow shape
+— nose bridge, nostrils, and tip anatomy
+— lip contour and natural asymmetry
+— jawline, cheek volume, chin, and forehead proportions
+— ear placement
+— natural skin tone, undertones, pores, texture, and imperfections
+— hair density, hairline, hairstyle texture, and natural falloff
+— neck and body proportions
+— apparent age
+
+Identity accuracy is more important than cinematic style.
+
+If scene accuracy conflicts with identity accuracy, always prioritize identity accuracy.
+
+EXPRESSION:
+Transfer only the emotional behavior from the reference scene:
+— same eye direction
+— same conversational focus
+— same subtle smile or mouth tension
+— same eyelid openness
+— same eyebrow tension
+— same relaxed intimate interaction
+
+Do not copy the original actors’ facial anatomy or expression anatomy.
+
+BODY & POSE:
+Preserve the reference scene’s sitting positions, distance between characters, head tilt, shoulder alignment, arm placement, hand placement, torso orientation, lower body posture, and overall framing.
+
+Rebuild anatomy using only the uploaded people.
+
+WARDROBE:
+Keep the same general silhouette and contrast:
+— male character in minimalist smart-casual evening clothing
+— female character in a bright cinematic yellow dress with natural folds
+
+Clothing must look physically real and naturally worn.
+
+ENVIRONMENT:
+Preserve the nighttime overlook atmosphere, distant city bokeh lights, mountain silhouettes, dusk sky gradient, concrete bench, outdoor depth, and realistic urban haze.
+
+LIGHTING:
+Integrate the faces naturally into the scene lighting.
+
+Use soft cinematic dusk lighting, realistic city ambient bounce, smooth shadow gradients, natural low-light contrast, subtle highlight rolloff, and realistic skin reflectivity.
+
+Avoid blown highlights, glowing skin, HDR contrast, waxy skin, artificial smoothing, beauty lighting, mismatched color temperature, pasted-on faces, and over-retouched texture.
+
+STYLE:
+Photorealistic cinematic still frame.
+Natural indie-film aesthetic.
+Shallow depth of field.
+Authentic film grain.
+Realistic optical falloff.
+No AI glamour look.
+No hyper-detailing.
+No uncanny symmetry.
+No synthetic beauty filtering.
+
+FINAL CHECK:
+The final image must be immediately recognizable as the exact uploaded people, not inspired-by versions, approximations, or beautified variants.`;
+
+const COLLAGE_1 = `Identity replacement only. Preserve the original image structure exactly. Using the provided split-frame portrait collage as the master reference and the separately uploaded male and female photos as identity references, completely replace the original subjects with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity. They must NOT define pose, head angle, face angle, gaze direction, expression, hairstyle placement, camera angle, composition, framing, lighting, body position, or image layout.
+
+Critical requirement: preserve the exact two-panel composition of the original image. The final image must remain a vertically stacked split-frame collage consisting of two completely separate portraits. Do not merge the subjects into the same scene. Do not make them interact. Do not place them side by side. Do not create a couple portrait. Maintain the original separation between the upper and lower frames.
+
+Upper frame:
+Replace the original woman with the exact female identity from the uploaded female reference photo. Preserve the exact pose, head tilt, facial angle, smile intensity, eye direction, shoulder position, neck angle, body orientation, camera distance, framing, lighting, hairstyle placement, and overall composition from the original upper portrait. The woman remains alone in the upper frame.
+
+Lower frame:
+Replace the original man with the exact male identity from the uploaded male reference photo. Preserve the exact pose, head angle, facial orientation, gaze direction, expression, shoulder position, neck angle, body orientation, camera distance, framing, lighting, hairstyle placement, and overall composition from the original lower portrait. The man remains alone in the lower frame.
+
+The model must reconstruct both uploaded individuals in full 3D and generate them from the exact viewing angles shown in the reference collage. If the uploaded identity photos show different face angles, profile views, three-quarter views, gaze directions, expressions, or poses, ignore them completely. Rotate and reconstruct the identities so that the final head orientation, facial angle, neck position, eye direction, and body posture match the original reference portraits exactly.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair volume
+- exact age characteristics
+- exact body type
+- exact overall appearance
+
+Preserve exactly:
+- split-frame collage layout
+- upper portrait composition
+- lower portrait composition
+- outdoor forest background
+- soft natural sunlight
+- warm golden-hour lighting
+- shallow depth of field
+- background blur
+- camera perspective
+- crop and framing
+- realistic color grading
+- cinematic romantic-drama photography aesthetic
+
+The final image must look like two authentic photographs of the uploaded individuals captured separately in the exact positions, framing, and camera angles shown in the original collage. Perfect identity preservation has the highest priority while maintaining exact pose matching and exact image layout.
+
+Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, natural anatomy, cinematic realism, realistic depth of field, seamless identity integration, highly detailed, flawless compositing.
+
+Negative prompt: merged subjects, couple portrait, shared frame, interaction between subjects, changed layout, changed framing, changed crop, changed camera angle, changed pose, changed head angle, changed facial angle, changed gaze direction, changed composition, face morphing, identity mixing, weak likeness, poor identity preservation, distorted face, asymmetrical eyes, crossed eyes, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, watermark, logo, text.`;
+
+const COLLAGE_2 = `Identity replacement only. Preserve the original image structure, composition, emotions, and scene exactly. Using the provided split-frame portrait collage as the master reference and the separately uploaded male and female photos as identity references, completely replace the original subjects with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity, physical appearance, body type, facial structure, skin characteristics, hair, and overall likeness. The original collage defines ALL emotions, expressions, pose, body positioning, head angle, gaze direction, posture, camera angle, framing, composition, lighting, and atmosphere.
+
+Critical requirement: preserve the exact two-panel collage layout. The image must remain as two completely separate portraits stacked vertically. Do not merge the subjects into one scene. Do not make them interact. Do not create a shared composition. Keep the exact separation between upper and lower frames.
+
+The uploaded individuals must be transferred completely, not only their faces. Reconstruct and replace the entire person in each frame, including face, head shape, hair, neck, shoulders, body proportions, physique, skin characteristics, and overall appearance. The result must look as if the uploaded individuals themselves were photographed in these exact scenes.
+
+Upper frame:
+Replace the original woman with the exact female identity from the uploaded female reference photo. Preserve her complete appearance while keeping the exact emotional expression from the original reference: intense joyful laughter, wide open smile, visible teeth, eyes naturally closed from laughter, head tilted backward, neck extended, identical facial expression intensity, identical body posture, identical camera angle, identical framing, and identical pose. The emotion and expression from the original reference must be preserved exactly.
+
+Lower frame:
+Replace the original man with the exact male identity from the uploaded male reference photo. Preserve his complete appearance while keeping the exact emotional expression from the original reference: subtle warm smile, relaxed facial muscles, calm romantic expression, gentle gaze directed slightly off-camera, identical head angle, identical posture, identical camera angle, identical framing, and identical pose. The emotion and expression from the original reference must be preserved exactly.
+
+The model must reconstruct both uploaded individuals in full 3D and generate them from the exact viewing angles shown in the reference collage. If the uploaded identity photos show different expressions, emotions, smiles, gaze directions, head angles, profile views, three-quarter views, hairstyles, poses, or body positions, ignore them completely. Preserve only their identity and physical appearance. Generate new views matching the original reference angles and expressions exactly.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact facial details
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair density
+- exact hair volume
+- exact age characteristics
+- exact body type
+- exact physique
+- exact body proportions
+- exact overall appearance
+
+Preserve exactly:
+- split-frame collage layout
+- upper frame composition
+- lower frame composition
+- carnival atmosphere
+- nighttime environment
+- warm carnival lights
+- bokeh highlights
+- shallow depth of field
+- background blur
+- framing and crop
+- lighting direction
+- color grading
+- cinematic romantic-drama aesthetic
+
+Highest priority:
+1. Perfect identity preservation of the uploaded individuals.
+2. Complete transfer of the uploaded individuals, not face-only replacement.
+3. Exact preservation of the original emotions and facial expressions.
+4. Exact preservation of the original pose, head angle, body position, framing, and composition.
+
+The final image must look like two authentic photographs of the uploaded individuals captured in these exact moments with these exact emotions and expressions. Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, cinematic realism, seamless identity integration, highly detailed, flawless compositing.
+
+Negative prompt: changed emotion, changed expression, changed smile, changed laughter, changed gaze direction, changed head angle, changed pose, changed framing, changed composition, face swap look, face-only replacement, identity mixing, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, crossed eyes, altered hairstyle, altered body type, merged subjects, shared frame, interaction between subjects, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, watermark, logo, text.`;
+
+const COLLAGE_3 = `Identity replacement only. Preserve the original image structure, composition, emotions, interaction dynamics, and atmosphere exactly. Using the provided split-frame portrait collage as the master reference and the separately uploaded male and female photos as identity references, completely replace the original subjects with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity, physical appearance, facial structure, body type, skin characteristics, hair, and overall likeness. The original collage defines ALL emotions, expressions, pose, body positioning, gaze direction, head angle, posture, framing, composition, lighting, and atmosphere.
+
+Critical requirement: preserve the exact two-panel collage layout. The final image must remain two completely separate portrait frames stacked vertically. Do not merge the subjects into one image. Do not place them together in the same frame. Preserve the original separation and layout exactly.
+
+The uploaded individuals must be transferred completely, not only their faces. Replace and reconstruct the entire person in each frame, including head shape, facial structure, hair, neck, shoulders, upper body, body proportions, physique, posture, skin details, and overall appearance. The result must look as if the uploaded individuals themselves were originally photographed in these exact scenes.
+
+Upper frame:
+Replace the original man with the exact male identity from the uploaded male reference photo. Preserve his complete appearance while maintaining the exact expression and emotional state from the reference image: subtle affectionate smile, soft eyes, gentle emotional warmth, slightly emotional and attentive gaze directed toward someone seated opposite him, identical head angle, identical eye direction, identical facial muscle tension, identical posture, identical framing, identical camera distance, and identical body positioning. Preserve the intimate dinner conversation atmosphere exactly.
+
+Lower frame:
+Replace the original woman with the exact female identity from the uploaded female reference photo. Preserve her complete appearance while maintaining the exact expression and emotional state from the reference image: genuine joyful smile, relaxed happiness, open-mouth laughter, bright eyes, natural warmth, identical facial expression intensity, identical eye direction, identical head angle, identical hand position supporting the side of her face, identical arm placement, identical posture, identical framing, identical camera distance, and identical body positioning. Preserve the exact emotional energy of the original image.
+
+The model must reconstruct both uploaded individuals in full 3D and generate them from the exact viewing angles shown in the reference collage. If the uploaded identity photos contain different expressions, emotions, smiles, gaze directions, poses, hairstyles, body positions, profile views, three-quarter views, or head angles, ignore those completely. Preserve only the identity and physical appearance. Generate new views matching the original reference portraits exactly.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact facial details
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair density
+- exact hair volume
+- exact age characteristics
+- exact body type
+- exact physique
+- exact body proportions
+- exact overall appearance
+
+Highest priority:
+1. Perfect identity preservation of the uploaded individuals.
+2. Complete transfer of the uploaded individuals, not face-only replacement.
+3. Exact preservation of the original emotions and facial expressions.
+4. Exact preservation of the original pose, hand placement, gaze direction, framing, and composition.
+5. The final result must look like authentic photographs, not face swaps.
+
+Preserve exactly:
+- split-frame collage layout
+- upper portrait composition
+- lower portrait composition
+- warm restaurant environment
+- romantic dinner atmosphere
+- soft golden ambient lighting
+- warm cinematic color grading
+- shallow depth of field
+- background bokeh lights
+- realistic perspective
+- framing and crop
+- lighting direction
+- natural shadows
+- intimate conversational mood
+
+The final image must look like two authentic photographs of the uploaded individuals captured during the exact moments shown in the reference collage, with identical emotions, expressions, posture, and atmosphere. Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, cinematic realism, seamless identity integration, highly detailed, natural depth of field, flawless compositing.
+
+Negative prompt: changed emotion, changed expression, changed smile, changed laughter, changed gaze direction, changed head angle, changed pose, changed hand position, changed framing, changed composition, face swap look, face-only replacement, identity mixing, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, crossed eyes, altered hairstyle, altered body type, merged subjects, shared frame, interaction between subjects, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, watermark, logo, text.`;
+
+const COLLAGE_4 = `Identity replacement only. Preserve the original image structure, composition, emotions, body language, and atmosphere exactly. Using the provided split-frame portrait collage as the master reference and the separately uploaded male and female photos as identity references, completely replace the original subjects with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity, physical appearance, facial structure, body type, skin characteristics, hair, and overall likeness. The original collage defines ALL emotions, expressions, pose, body positioning, posture, hand placement, gaze direction, head angle, camera angle, framing, composition, clothing placement, lighting, and atmosphere.
+
+Critical requirement: transfer the uploaded individuals completely, not only their faces. Replace and reconstruct the entire person in each frame, including face, head shape, hair, neck, shoulders, arms, hands, torso, body proportions, physique, posture, skin details, and overall appearance. The final result must look as if the uploaded individuals themselves were originally photographed in these exact scenes.
+
+Preserve the exact two-panel collage layout. The image must remain as two separate vertically stacked portrait frames. Do not merge the subjects into a shared scene. Do not place them together in one frame. Maintain the original separation between the upper and lower portraits exactly.
+
+Upper frame:
+Replace the original woman with the exact female identity from the uploaded female reference photo while preserving her complete appearance and full body characteristics. Preserve the exact expression and emotional state from the original reference: warm affectionate smile, gentle happiness, soft romantic emotion, relaxed confidence, identical eye direction, identical head angle, identical facial expression intensity, identical posture, identical shoulder position, identical hand placement holding the scarf, identical arm positions, identical body orientation, identical framing, identical camera distance, and identical body language. Preserve the elegant entrance moment exactly.
+
+Lower frame:
+Replace the original man with the exact male identity from the uploaded male reference photo while preserving his complete appearance and full body characteristics. Preserve the exact expression and emotional state from the original reference: warm satisfied smile, emotional admiration, subtle happiness, gentle confidence, identical eye direction, identical head angle, identical facial expression intensity, identical posture, identical shoulder position, identical neck angle, identical body orientation, identical framing, identical camera distance, and identical body language. Preserve the elegant formal atmosphere exactly.
+
+The model must reconstruct both uploaded individuals in full 3D and generate them from the exact viewing angles shown in the reference collage. If the uploaded identity photos contain different expressions, emotions, smiles, gaze directions, hairstyles, poses, body positions, profile views, three-quarter views, camera angles, or head angles, ignore those completely. Preserve only identity and physical appearance. Generate entirely new views that match the original reference portraits exactly.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact facial details
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair density
+- exact hair volume
+- exact age characteristics
+- exact body type
+- exact physique
+- exact body proportions
+- exact shoulder width
+- exact neck structure
+- exact hand appearance
+- exact overall appearance
+
+Highest priority:
+1. Perfect identity preservation of the uploaded individuals.
+2. Full-person transfer, including body, posture, physique, and proportions, not face-only replacement.
+3. Exact preservation of the original emotions and facial expressions.
+4. Exact preservation of hand placement, posture, gaze direction, framing, composition, and body language.
+5. The final result must look like authentic photographs, not face swaps.
+
+Preserve exactly:
+- split-frame collage layout
+- upper portrait composition
+- lower portrait composition
+- warm cinematic indoor lighting
+- elegant romantic atmosphere
+- doorway scene in upper frame
+- formal event scene in lower frame
+- realistic depth of field
+- background blur
+- framing and crop
+- lighting direction
+- color grading
+- natural shadows
+- cinematic romance-drama aesthetic
+
+The final image must look like two authentic photographs of the uploaded individuals captured in these exact moments with identical emotions, expressions, posture, body language, and atmosphere. Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, realistic hands, realistic body proportions, cinematic realism, seamless identity integration, highly detailed, natural depth of field, flawless compositing.
+
+Negative prompt: face-only replacement, partial identity transfer, changed emotion, changed expression, changed smile, changed gaze direction, changed head angle, changed hand position, changed posture, changed body proportions, changed physique, changed framing, changed composition, identity mixing, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, crossed eyes, altered hairstyle, altered body type, merged subjects, shared frame, interaction between subjects, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, extra fingers, malformed hands, watermark, logo, text.`;
+
+const COLLAGE_5 = `Identity replacement only. Preserve the original image structure, composition, emotional tone, body language, scene layout, continuity between frames, and atmosphere exactly. Using the provided split-frame scene image as the master reference and the separately uploaded male and female photos as identity references, completely replace the original subjects with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity, physical appearance, facial structure, body type, skin characteristics, hair, and overall likeness. The original scene defines ALL emotions, expressions, pose, body positioning, posture, gaze direction, head orientation, camera angle, framing, composition, clothing fit, lighting, atmosphere, and interaction.
+
+Critical requirement: transfer the uploaded individuals completely, not only their faces. Replace and reconstruct the entire person in each frame, including head shape, facial structure, hair, neck, shoulders, arms, torso, body proportions, physique, posture, skin details, silhouette, and overall appearance. The final result must look as if the uploaded individuals themselves were originally photographed in these exact scenes.
+
+Preserve the exact two-panel stacked layout. The image must remain as two separate frames. Do not merge the subjects into a shared portrait. Do not alter the framing, crop, perspective, camera position, scene structure, or relationship between the frames.
+
+Critical continuity requirement:
+
+The male subject appears multiple times throughout the image.
+
+1. As the primary subject in the lower frame.
+2. As the blurred out-of-focus figure visible on the right side of the upper frame.
+
+These are the same character and must be replaced consistently.
+
+Replace every visible appearance of the original male character throughout the entire image, including primary appearances, secondary appearances, blurred appearances, foreground appearances, background appearances, cropped appearances, partially visible appearances, silhouettes, and out-of-focus appearances.
+
+The blurred man visible in the upper frame must become the uploaded male individual as well. It is not a separate person. Any visible facial structure, head shape, hairline, hairstyle, skin tone, ears, neck, body shape, silhouette, and physical characteristics must belong to the uploaded male individual.
+
+Do not leave any part of the original male character visible anywhere in the image.
+
+Upper frame:
+Replace the original woman with the exact female identity from the uploaded female reference photo. Preserve her complete appearance and full body characteristics while maintaining the exact emotional state from the reference image: serious, focused, emotionally controlled, attentive expression, neutral lips, calm confidence, direct gaze toward someone sitting opposite her, identical eye direction, identical head angle, identical neck position, identical posture, identical shoulder placement, identical body orientation, identical framing, identical camera distance, and identical body language.
+
+The blurred male figure visible on the right side of the upper frame must also be replaced with the uploaded male individual while remaining naturally blurred and out of focus according to the original depth of field.
+
+Lower frame:
+Replace the original man with the exact male identity from the uploaded male reference photo. Preserve his complete appearance and full body characteristics while maintaining the exact emotional state from the reference image: thoughtful, slightly concerned, emotionally restrained expression, lips slightly pursed, attentive gaze directed upward toward the woman, identical eye direction, identical head angle, identical neck position, identical posture, identical shoulder placement, identical body orientation, identical framing, and identical camera distance.
+
+The model must reconstruct both uploaded individuals in full 3D and generate them from the exact viewing angles shown in the reference image. If the uploaded identity photos contain different expressions, smiles, emotions, poses, hairstyles, body positions, profile views, three-quarter views, camera angles, or head angles, ignore those completely. Preserve only identity and physical appearance. Generate entirely new views matching the original reference scenes exactly.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape and spacing
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact facial details
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair density
+- exact hair volume
+- exact age characteristics
+- exact body type
+- exact physique
+- exact body proportions
+- exact shoulder width
+- exact neck structure
+- exact overall appearance
+
+Highest priority:
+1. Perfect identity preservation of the uploaded individuals.
+2. Full-person transfer, including body, physique, posture, and proportions, not face-only replacement.
+3. Replacement of every appearance of the male character throughout the entire image.
+4. Exact preservation of the original emotions and facial expressions.
+5. Exact preservation of gaze direction, posture, framing, camera angle, composition, and body language.
+6. The final result must look like authentic photographs, not face swaps.
+
+Preserve exactly:
+- split-frame layout
+- upper scene composition
+- lower scene composition
+- diner interior environment
+- conversational setup
+- warm cinematic lighting
+- realistic depth of field
+- background blur
+- framing and crop
+- lighting direction
+- color grading
+- natural shadows
+- cinematic drama aesthetic
+- clothing style and placement
+- realistic interaction implied between frames
+
+The final image must look like two authentic photographs of the uploaded individuals captured in these exact moments with identical emotions, expressions, posture, body language, and atmosphere. Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, realistic body proportions, cinematic realism, seamless identity integration, highly detailed, natural depth of field, flawless compositing.
+
+Negative prompt: face-only replacement, partial identity transfer, unchanged background character, unchanged blurred character, original male character remaining anywhere in the image, changed emotion, changed expression, changed gaze direction, changed head angle, changed posture, changed body proportions, changed physique, changed framing, changed composition, identity mixing, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, crossed eyes, altered hairstyle, altered body type, merged subjects, shared frame, incorrect eye contact, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, extra fingers, malformed hands, watermark, logo, text.`;
+
+const COLLAGE_6 = `Identity replacement only. Preserve the original image structure, composition, continuity, emotional tone, body language, scene layout, facial geometry, and atmosphere exactly. Using the provided split-frame scene image as the master reference and the separately uploaded male and female photos as identity references, completely replace the original subjects with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity, physical appearance, facial structure, body type, skin characteristics, hair, and overall likeness. The original scene defines ALL emotions, expressions, pose, body positioning, posture, gaze direction, head orientation, camera angle, framing, composition, lighting, clothing placement, interaction, and atmosphere.
+
+Critical facial identity preservation requirement:
+
+The uploaded male and female reference photos are the ONLY source of facial identity in the final image.
+
+Do not preserve, copy, blend, inherit, approximate, borrow, retain, reconstruct from, or partially use any facial features from any person visible in the original reference image.
+
+Remove the original identities completely.
+
+Every visible face in the final image must belong exclusively to the uploaded individuals.
+
+The uploaded identities must fully replace the original identities across the entire image.
+
+Identity accuracy has higher priority than resemblance to the original actors.
+
+No face morphing.
+No identity blending.
+No actor resemblance.
+No facial approximation.
+No reconstruction based on the original reference faces.
+
+Only the uploaded identities may appear in the final image.
+
+Critical requirement for lying-down poses:
+
+Both subjects are lying down and viewed from unusual camera angles.
+
+Preserve the exact facial proportions of the uploaded individuals while adapting them to the lying-down position.
+
+Do not distort facial geometry due to head tilt, camera perspective, body position, foreshortening, or rotation.
+
+Do not stretch, compress, widen, narrow, warp, deform, smooth, reshape, stylize, or alter the uploaded facial structure.
+
+Maintain exact:
+- eye spacing
+- eye shape
+- eyebrow shape
+- eyebrow placement
+- nose proportions
+- lip proportions
+- jawline shape
+- cheekbone structure
+- forehead proportions
+- chin shape
+- head shape
+- facial symmetry
+- facial proportions
+
+The lying-down pose must not reduce identity accuracy.
+
+The subjects must look exactly like the uploaded individuals photographed while lying in the positions shown in the reference image.
+
+Generate anatomically correct rotated views of the uploaded faces while preserving full recognizability.
+
+Critical requirement: transfer the uploaded individuals completely, not only their faces. Replace and reconstruct the entire person in every visible appearance throughout the image, including face, head shape, hair, neck, shoulders, torso, arms, hands, body proportions, physique, silhouette, skin details, posture, and overall appearance.
+
+Preserve the exact two-panel stacked layout. The image must remain as two separate frames. Do not merge the subjects into one image. Do not change framing, crop, perspective, camera position, depth of field, scene structure, or composition.
+
+Critical continuity requirement:
+
+Both characters appear multiple times throughout the image.
+
+The female character appears:
+1. As the primary subject in the upper frame.
+2. As the blurred foreground figure visible in the lower-left corner of the lower frame.
+
+The male character appears:
+1. As the primary subject in the lower frame.
+2. As the blurred foreground figure visible in the lower-right corner of the upper frame.
+
+These are not separate people. They are the same two characters shown from different camera angles and at different depths of field.
+
+Replace every visible appearance of both original characters throughout the entire image, including:
+- primary appearances
+- secondary appearances
+- blurred appearances
+- foreground appearances
+- background appearances
+- cropped appearances
+- partially visible appearances
+- silhouettes
+- out-of-focus appearances
+
+The blurred male figure visible in the upper frame must become the uploaded male individual.
+
+The blurred female figure visible in the lower frame must become the uploaded female individual.
+
+Identity consistency must be maintained across all appearances.
+
+Do not leave any part of the original characters visible anywhere in the image.
+
+Upper frame:
+
+Replace the original woman with the exact female identity from the uploaded female reference photo. Preserve her complete appearance and full body characteristics while maintaining the exact emotional state from the reference image: warm affectionate smile, relaxed happiness, playful romantic expression, soft eyes, gentle emotional connection, identical eye direction, identical head angle, identical facial expression intensity, identical posture, identical shoulder position, identical body orientation, identical framing, identical camera distance, and identical body language.
+
+The blurred male figure visible in the lower-right corner of the upper frame must also be replaced with the uploaded male individual while remaining naturally blurred and out of focus according to the original depth of field.
+
+Lower frame:
+
+Replace the original man with the exact male identity from the uploaded male reference photo. Preserve his complete appearance and full body characteristics while maintaining the exact emotional state from the reference image: calm thoughtful expression, subtle romantic attention, relaxed facial muscles, gentle eye contact, identical eye direction, identical head angle, identical neck position, identical posture, identical body orientation, identical framing, identical camera distance, and identical body language.
+
+The blurred female figure visible in the lower-left corner of the lower frame must also be replaced with the uploaded female individual while remaining naturally blurred and out of focus according to the original depth of field.
+
+The model must reconstruct both uploaded individuals in full 3D and generate them from the exact viewing angles shown in the reference image. If the uploaded identity photos contain different expressions, emotions, smiles, poses, hairstyles, body positions, profile views, three-quarter views, camera angles, or head angles, ignore those completely. Preserve only identity and physical appearance. Generate entirely new views matching the original reference scenes exactly.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape and spacing
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact facial details
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair density
+- exact hair volume
+- exact age characteristics
+- exact body type
+- exact physique
+- exact body proportions
+- exact shoulder width
+- exact neck structure
+- exact hand appearance
+- exact overall appearance
+
+Highest priority:
+1. Perfect identity preservation of the uploaded individuals.
+2. Complete removal of all facial characteristics belonging to the original reference subjects.
+3. Full-person transfer, including body, physique, posture, and proportions, not face-only replacement.
+4. Replacement of every appearance of both characters throughout the entire image.
+5. Exact preservation of the original emotions and facial expressions.
+6. Exact preservation of gaze direction, posture, framing, camera angle, composition, and body language.
+7. The final result must look like authentic photographs, not face swaps.
+
+Preserve exactly:
+- split-frame layout
+- upper scene composition
+- lower scene composition
+- outdoor daytime environment
+- warm natural sunlight
+- realistic depth of field
+- foreground blur
+- background blur
+- framing and crop
+- lighting direction
+- color grading
+- natural shadows
+- romantic atmosphere
+- cinematic realism
+- clothing style and placement
+- realistic interaction implied between frames
+
+The final image must look like two authentic photographs of the uploaded individuals captured in these exact moments with identical emotions, expressions, posture, body language, and atmosphere. Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, realistic hands, realistic body proportions, cinematic realism, seamless identity integration, highly detailed, natural depth of field, flawless compositing.
+
+Negative prompt: face-only replacement, partial identity transfer, original actor facial features, original actor resemblance, identity blending, face morphing, facial distortion, stretched face, compressed face, warped face, altered facial proportions, incorrect facial geometry, changed eye spacing, changed jawline, changed nose shape, changed facial structure, unchanged blurred character, unchanged foreground character, unchanged background character, original characters remaining anywhere in the image, changed emotion, changed expression, changed smile, changed gaze direction, changed head angle, changed posture, changed body proportions, changed physique, changed framing, changed composition, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, crossed eyes, altered hairstyle, altered body type, merged subjects, shared frame, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, extra fingers, malformed hands, watermark, logo, text.`;
+
+const COLLAGE_7 = `Replace the people in the reference image with the people from the uploaded photos. Completely remove the original people from the reference and do not use any of their facial features or appearance. Transfer the uploaded people as full characters into the scene: not only the face or head, but the entire body — face, hair, head, neck, shoulders, torso, arms, hands, legs, body shape, anatomy, proportions, and overall silhouette. This is not a face swap or head replacement. Do not keep any part of the original people’s bodies from the reference. The uploaded people must look as if they were originally photographed in this exact scene.
+
+
+
+Preserve the identity of the uploaded people with maximum accuracy: exact facial features, eye shape, nose structure, lips, cheekbones, jawline, face proportions, unique details, hairstyle, and natural appearance. Do not blend or mix the appearance of the uploaded people with the people from the reference. Take absolutely no facial characteristics or identity features from the reference people.
+
+
+
+Use the reference only for the scene elements: composition, camera angle, body position, pose, head rotation, gaze direction, lighting, atmosphere, clothing style, and emotional expression. The uploaded people must recreate the exact emotions from the reference — the same smile, eye expression, mood, facial expression, and connection between the characters — while keeping their own unique appearance.
+
+
+
+If the people in the reference have a specific pose, body position, or head angle, recreate that same pose and perspective with the uploaded people. Generate their bodies naturally in that position instead of simply placing their faces onto existing bodies. The entire body must be reconstructed correctly according to the scene.
+
+
+
+The final image must look like a real cinematic photograph: realistic skin texture, correct anatomy, natural lighting, realistic proportions, seamless integration, no collage effect, no Photoshop look, no pasted faces, no artificial face replacement.
+
+
+
+Negative prompt / restrictions:
+
+Only transferring the head is forbidden. Only transferring the face is forbidden. No face swap, no head swap, no face pasted onto another body, no original reference body parts, no mixed identities, no blended facial features, no hybrid person, no altered facial structure, no loss of identity from the uploaded people, no incorrect body proportions. The uploaded people must be transferred completely, with their own faces and their own full bodies, while matching the reference pose and emotions exactly.`
+
+const COLLAGE_8 = `Identity replacement only. Complete subject replacement with zero identity retention from the reference image.
+
+Using the provided split-frame collage as the master scene reference and the separately uploaded male and female photos as identity references, completely remove all original subjects from the reference image and replace them with the exact individuals from the uploaded photos.
+
+Critical replacement requirement:
+
+Before generating the final image, completely remove all original people from the reference image.
+
+Treat all original subjects as deleted placeholders.
+
+Nothing from their identity may remain.
+
+The uploaded photos define 100% of the people.
+
+The reference image defines ONLY:
+- composition
+- framing
+- camera angle
+- lighting
+- environment
+- emotion
+- facial expression
+- gaze direction
+- head angle
+- neck angle
+- posture
+- body language
+
+Critical priority order:
+
+1. Exact identity preservation from uploaded photos.
+2. Zero identity retention from reference subjects.
+3. Full-body reconstruction of uploaded people.
+4. Exact emotion transfer.
+5. Exact pose transfer.
+6. Scene composition.
+7. Lighting and environment.
+
+Critical anti-identity-mixing requirement:
+
+Absolutely no facial blending is allowed.
+
+The final faces must contain 0% identity information from the reference subjects.
+
+The reference subjects must contribute ZERO facial identity data.
+
+This includes zero contribution from:
+- facial geometry
+- skull geometry
+- head shape
+- facial proportions
+- eye socket structure
+- eye shape
+- eye spacing
+- eyebrow structure
+- nose bridge
+- nose width
+- nostril shape
+- lips
+- mouth shape
+- philtrum
+- jawline
+- cheekbone structure
+- chin shape
+- forehead shape
+- temple shape
+- ears
+- skin texture
+- facial asymmetry
+- age markers
+
+Do not use the reference subjects as facial base geometry.
+
+Do not use the reference faces as structural templates.
+
+Do not use the reference faces as reconstruction anchors.
+
+Do not morph the uploaded identities onto the reference faces.
+
+Instead:
+
+Completely discard the original reference identities.
+
+Build entirely new facial geometry from the uploaded identity photos only.
+
+The uploaded identity photos must provide 100% of facial geometry.
+
+The reference image provides 0% facial geometry.
+
+Critical reconstruction rule:
+
+Step 1:
+Delete the original people completely.
+
+Step 2:
+Extract full identity from uploaded photos.
+
+Step 3:
+Reconstruct entirely new 3D facial geometry from uploaded photos only.
+
+Step 4:
+Apply reference pose, emotion, gaze, and lighting to the newly reconstructed people.
+
+Never start from the reference faces.
+
+Always start from the uploaded identities.
+
+Identity preservation is more important than pose accuracy.
+
+Identity preservation is more important than expression accuracy.
+
+Identity preservation is more important than resemblance to the reference subjects.
+
+Critical 3D identity reconstruction requirement:
+
+Do NOT copy-paste the uploaded people into the reference scene.
+
+Do NOT perform a simple cut-and-paste replacement.
+
+Do NOT perform a basic face swap.
+
+This task requires full identity reconstruction.
+
+The model must fully reconstruct the uploaded individuals in 3D and generate entirely new photorealistic views of them matching the reference scene.
+
+The uploaded photos are identity references only.
+
+The reference image is a pose, emotion, composition, and camera-angle reference only.
+
+Critical head rotation requirement:
+
+The uploaded photos may show:
+- frontal view
+- three-quarter view
+- side profile
+- tilted head
+- different gaze direction
+- different expression
+
+Ignore all of that.
+
+Use ONLY identity from the uploaded photos.
+
+Then reconstruct the uploaded individuals and rotate their heads into the exact angles shown in the reference image.
+
+Preserve exactly:
+- head rotation
+- head tilt
+- neck angle
+- gaze direction
+- eye direction
+- facial orientation
+- body angle
+- posture
+
+Critical emotion transfer requirement:
+
+The uploaded photos may contain different emotions.
+
+Ignore them completely.
+
+Recreate the uploaded individuals with the exact same emotional expression as the reference subjects.
+
+Preserve exactly:
+- smile intensity
+- lip position
+- mouth shape during expression
+- eye expression
+- eyelid openness
+- eyebrow tension
+- facial muscle tension
+- emotional intensity
+
+Critical full-person replacement requirement:
+
+This is NOT a face swap.
+
+Do NOT replace only the face.
+Do NOT replace only the head.
+Do NOT keep the original body.
+Do NOT keep the original silhouette.
+Do NOT keep the original proportions.
+
+Replace the entire person completely.
+
+Transfer the uploaded people fully, including:
+- face
+- head
+- skull shape
+- hair
+- hairline
+- forehead
+- ears
+- neck
+- shoulders
+- torso
+- arms
+- hands
+- body proportions
+- physique
+- silhouette
+- posture
+- skin characteristics
+- age characteristics
+- overall appearance
+
+No pasted-face appearance.
+No head-swap appearance.
+No partial replacement.
+
+Critical facial identity preservation:
+
+Preserve exactly:
+- facial structure
+- facial proportions
+- eye shape
+- eye spacing
+- eyebrow shape
+- eyebrow placement
+- nose shape
+- nose proportions
+- lips
+- mouth shape
+- jawline
+- cheekbones
+- chin
+- forehead proportions
+- ears
+- skin texture
+- skin tone
+- facial asymmetry
+- unique facial characteristics
+- age characteristics
+- head shape
+
+Do not reinterpret.
+Do not beautify.
+Do not stylize.
+Do not average.
+Do not approximate.
+Do not optimize facial features.
+
+Critical pose reconstruction:
+
+Reconstruct uploaded individuals in full 3D.
+
+Generate them from the exact camera angle shown in the reference image.
+
+Maintain identity accuracy after rotation.
+
+Do not distort facial geometry due to:
+- head rotation
+- perspective
+- camera angle
+- foreshortening
+
+Identity must remain accurate from all angles.
+
+Preserve exactly:
+- split-frame collage layout
+- composition
+- lighting
+- environment
+- depth of field
+- framing
+- crop
+- color grading
+- natural shadows
+- cinematic atmosphere
+
+Highest priority:
+
+1. Complete removal of original reference identities.
+2. Perfect transfer of uploaded people.
+3. Zero facial blending.
+4. Full-body transfer.
+5. Exact emotion transfer.
+6. Exact head angle and gaze direction.
+7. Photorealistic seamless result.
+
+The final image must look like authentic cinematic photographs of the uploaded individuals captured in these exact moments with identical expressions, identical emotions, identical head poses, identical body language, and identical atmosphere.
+
+Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, realistic proportions, seamless identity integration, cinematic realism, highly detailed.
+
+Negative prompt:
+reference face geometry, original actor facial features, original actor resemblance, identity blending, facial blending, face morphing, face swap, head swap, partial replacement, pasted face, pasted head, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, altered facial proportions, changed expression, changed emotion, changed gaze direction, changed head angle, changed posture, changed body proportions, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, watermark, logo, text.`
+
+const COLLAGE_9 = `Identity replacement only. Complete subject replacement with zero identity retention from the reference image.
+
+Using the provided split-frame collage as the master scene reference and the separately uploaded male and female photos as identity references, completely remove all original subjects from the reference image and replace them with the exact individuals from the uploaded photos.
+
+Critical replacement requirement:
+
+Before generating the final image, completely remove all original people from the reference image.
+
+Treat all original subjects as deleted placeholders.
+
+Nothing from their identity may remain.
+
+The uploaded photos define 100% of the people.
+
+The reference image defines ONLY:
+- composition
+- framing
+- camera angle
+- lighting
+- environment
+- emotion
+- facial expression
+- gaze direction
+- head angle
+- neck angle
+- posture
+- body language
+
+Critical continuity requirement:
+
+Both characters appear multiple times throughout the collage.
+
+Female appears:
+1. As primary subject in upper frame.
+2. As blurred foreground figure on the right side of lower frame.
+
+Male appears:
+1. As primary subject in lower frame.
+2. As blurred foreground figure on the left side of upper frame.
+
+These are NOT separate people.
+
+They are the same two people shown from different angles and different depth-of-field layers.
+
+Replace every visible appearance of both people.
+
+Including:
+- main appearances
+- blurred appearances
+- foreground silhouettes
+- cropped appearances
+- partial appearances
+- out-of-focus appearances
+
+Critical priority order:
+
+1. Exact identity preservation from uploaded photos.
+2. Zero identity retention from reference subjects.
+3. Full-body reconstruction of uploaded people.
+4. Exact emotion transfer.
+5. Exact pose transfer.
+6. Scene composition.
+7. Lighting and environment.
+
+Critical anti-identity-mixing requirement:
+
+Absolutely no facial blending is allowed.
+
+The final faces must contain 0% identity information from the reference subjects.
+
+The reference subjects contribute ZERO facial identity data.
+
+Do not use reference face geometry.
+
+Do not use reference skull geometry.
+
+Do not use reference facial structure as base mesh.
+
+Do not morph uploaded identities onto reference faces.
+
+Delete original people completely.
+
+Build entirely new facial geometry from uploaded photos only.
+
+Critical 3D identity reconstruction requirement:
+
+This is NOT a face swap.
+
+Do NOT replace only the face.
+Do NOT replace only the head.
+Do NOT paste uploaded faces onto reference bodies.
+
+This task requires full identity reconstruction.
+
+The model must reconstruct both uploaded individuals fully in 3D.
+
+Then generate brand new photorealistic renders matching the reference scene.
+
+Critical head rotation requirement:
+
+Both characters are shown at strong three-quarter angles.
+
+The uploaded photos may show:
+- frontal view
+- different profile angle
+- different head tilt
+- different expression
+- different gaze direction
+
+Ignore all of that.
+
+Use ONLY identity from uploaded photos.
+
+Then rotate and reconstruct both uploaded individuals into the exact angles shown in the reference image.
+
+Preserve exactly:
+- head rotation
+- head tilt
+- neck angle
+- gaze direction
+- facial orientation
+- body angle
+- posture
+
+Identity must remain fully accurate after rotation.
+
+No loss of likeness during head rotation.
+
+No facial distortion.
+
+No identity drift.
+
+Critical emotion transfer requirement:
+
+The uploaded photos may contain different emotions.
+
+Ignore them completely.
+
+Recreate the uploaded individuals with the exact same emotional expressions as shown in the reference image.
+
+Preserve exactly:
+- smile intensity
+- lip shape during smile
+- eye expression
+- eyelid openness
+- eyebrow tension
+- cheek movement
+- facial muscle tension
+- emotional intensity
+
+Upper frame:
+
+Replace the original woman with the exact uploaded female identity.
+
+Preserve ONLY:
+- warm genuine smile
+- romantic softness
+- affectionate expression
+- identical smile intensity
+- identical eye expression
+- identical gaze direction
+- identical head angle
+- identical neck angle
+- identical posture
+- identical framing
+
+The blurred male foreground visible on the left side must also be replaced with the uploaded male identity.
+
+Lower frame:
+
+Replace the original man with the exact uploaded male identity.
+
+Preserve ONLY:
+- warm subtle smile
+- romantic affection
+- gentle admiration
+- identical smile intensity
+- identical eye expression
+- identical gaze direction
+- identical head angle
+- identical neck angle
+- identical posture
+- identical framing
+
+The blurred female foreground visible on the right side must also be replaced with the uploaded female identity.
+
+Critical full-person replacement requirement:
+
+Replace the uploaded people fully, including:
+- face
+- head
+- skull shape
+- hair
+- hairline
+- forehead
+- ears
+- neck
+- shoulders
+- torso
+- body proportions
+- physique
+- silhouette
+- posture
+- skin characteristics
+- age characteristics
+- overall appearance
+
+No pasted-face appearance.
+No head-swap appearance.
+No partial replacement.
+
+Preserve exactly:
+- split-frame collage layout
+- sunset golden-hour lighting
+- beach environment
+- warm cinematic tones
+- shallow depth of field
+- foreground blur
+- background blur
+- framing
+- crop
+- color grading
+- natural shadows
+- romantic atmosphere
+
+Highest priority:
+
+1. Complete removal of original reference identities.
+2. Perfect transfer of uploaded people.
+3. Zero facial blending.
+4. Full-person transfer.
+5. Exact emotion transfer.
+6. Exact head angle and gaze direction.
+7. Photorealistic seamless result.
+
+The final image must look like authentic cinematic photographs of the uploaded individuals captured in these exact moments with identical expressions, identical emotions, identical smiles, identical head poses, identical body language, and identical atmosphere.
+
+Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, realistic proportions, seamless identity integration, cinematic realism, highly detailed.
+
+Negative prompt:
+reference face geometry, original actor facial features, original actor resemblance, identity blending, facial blending, face morphing, face swap, head swap, partial replacement, pasted face, pasted head, weak likeness, inaccurate facial features, distorted face, asymmetrical eyes, altered facial proportions, changed expression, changed emotion, changed gaze direction, changed head angle, changed posture, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, watermark, logo, text.`
+
+const SMITH_1 = `Identity replacement only. Preserve the original scene exactly. Using the provided ballroom scene image as the composition reference and the separately uploaded male and female photos as identity references, completely replace the original couple with the exact individuals from the uploaded reference images while preserving the original photograph in every other aspect. Keep the exact composition, framing, camera angle, crop, body positioning, hand placement, facial proximity, head tilt, gaze direction, near-kiss moment, slow-dance pose, romantic interaction, emotional tension, ballroom environment, blurred guests in the background, shallow depth of field, cinematic bokeh, warm golden lighting, and overall atmosphere. Replace the male subject with the exact man from the male reference image, preserving his recognizable facial identity, facial proportions, hairstyle, skin tone, age characteristics, and overall appearance. Replace the female subject with the exact woman from the female reference image, preserving her recognizable facial identity, facial proportions, hairstyle, skin tone, age characteristics, and overall appearance. Maintain the original elegant formal attire style, including the dark suit and black sleeveless evening dress, adapted naturally to the new identities. The final result must look like an authentic high-end cinematic photograph captured in a luxury ballroom, not a face swap. Perfect identity preservation, seamless photorealistic integration, realistic skin texture, natural facial expressions, realistic anatomy, anatomically correct hands and fingers, natural body proportions, authentic clothing folds, premium DSLR photography, 85mm lens, f/1.8, ultra photorealistic movie still, film-grade color grading, natural shadows, realistic depth, flawless compositing. Negative prompt: altered pose, changed composition, changed framing, changed camera angle, changed lighting, changed background, face morphing, identity mixing, weak likeness, bad face swap, distorted face, asymmetrical eyes, crossed eyes, malformed hands, extra fingers, fused fingers, missing fingers, duplicated fingers, duplicated limbs, broken anatomy, unrealistic skin, plastic skin, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, watermark, logo, text.`;
+
+const SMITH_2 = `Identity replacement only. Preserve the original scene exactly. Using the provided kitchen scene image as the composition reference and the separately uploaded male and female photos as identity references, completely replace the original couple with the exact individuals from the uploaded reference images while preserving the original photograph in every other aspect. Keep the exact composition, framing, crop, camera angle, body positions, facial expressions, eye contact, hand placement, distance between subjects, posture, interaction, kitchen environment, countertop, sink, faucet, strawberry in hand, cooking interaction, background details, depth of field, lighting, and overall atmosphere. Replace the male subject with the exact man from the uploaded male reference image, preserving his recognizable facial identity, facial proportions, hairstyle, skin tone, age characteristics, and overall appearance while maintaining the original body position, smile, gaze direction, and white V-neck T-shirt. Replace the female subject with the exact woman from the uploaded female reference image, preserving her recognizable facial identity, facial proportions, hairstyle, skin tone, age characteristics, and overall appearance while maintaining the original body position, smile, gaze direction, hand placement, and oversized white button-up shirt. Preserve the playful romantic domestic interaction, natural chemistry, relaxed body language, intimate everyday moment, warm indoor lighting, soft shadows, shallow depth of field, cinematic realism, and candid lifestyle photography aesthetic. The final image must look like a genuine photograph of the two uploaded individuals naturally sharing a moment together in a modern kitchen, not a face swap. Perfect identity preservation, seamless photorealistic integration, realistic skin texture, natural facial expressions, realistic anatomy, anatomically correct hands and fingers, authentic clothing folds, realistic body proportions, premium DSLR photography, 50mm lens, f/2.0, ultra photorealistic, cinematic lifestyle movie still, natural color grading, realistic depth, flawless compositing. Negative prompt: altered pose, changed composition, changed framing, changed camera angle, changed lighting, changed background, changed clothing style, face morphing, identity mixing, weak likeness, poor face swap, distorted face, asymmetrical eyes, crossed eyes, malformed hands, extra fingers, fused fingers, missing fingers, duplicated fingers, duplicated limbs, broken anatomy, unrealistic skin, plastic skin, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, watermark, logo, text.`;
+
+const SMITH_3 = `Identity replacement only. Preserve the original scene exactly. Using the provided tactical scene image as the master reference for composition, camera angle, body positioning, head orientation, gaze direction, posture, perspective, interaction, lighting, and framing, and using the separately uploaded male and female photos strictly as identity references, completely replace the original man and woman with the exact individuals from the uploaded reference photos.
+
+The uploaded photos define ONLY identity. They must NOT define pose, head angle, facial angle, body orientation, gaze direction, expression, posture, camera perspective, or composition. Reconstruct both individuals in full 3D and place them into the exact physical positions shown in the scene reference.
+
+Critical requirement: preserve the exact pose of the original scene. The male subject must remain in the same crouched tactical position, torso angled toward the left side of the frame, shoulders leaning forward, head turned toward the female subject, eyes directed toward the female subject, with the exact same neck angle, shoulder angle, arm position, and body orientation as the original image. The female subject must remain in the same crouched tactical position, leaning slightly forward, torso angled toward the left side of the frame, head turned forward-left, eyes looking ahead, with the exact same neck angle, shoulder position, arm placement, and body orientation as the original image.
+
+The model must physically rotate and reconstruct the uploaded faces to match the exact head orientation of the scene reference. If the uploaded identity photos are frontal, profile, three-quarter, looking elsewhere, smiling, or facing another direction, ignore those angles completely. Generate new views of the faces so that the final head rotation, yaw, pitch, roll, neck position, eye direction, and facial angle match the scene reference exactly. Identity must remain fully recognizable after rotation. Do not preserve the original face angle from the uploaded photos.
+
+Transfer and preserve with maximum accuracy:
+- exact facial structure
+- exact facial proportions
+- exact eye shape and spacing
+- exact eyebrow shape
+- exact nose shape
+- exact lips
+- exact jawline
+- exact cheekbones
+- exact ears
+- exact skin tone
+- exact skin texture
+- exact hairstyle
+- exact hairline
+- exact hair color
+- exact hair density and volume
+- exact age characteristics
+- exact body type
+- exact physique
+- exact body proportions
+- exact overall appearance
+
+Preserve exactly:
+- tactical armor and equipment
+- yellow protective glasses
+- clothing style and placement
+- action scene atmosphere
+- camera perspective
+- crop and framing
+- background structure
+- lighting direction
+- shadows
+- depth of field
+- cinematic action-movie realism
+
+The final image must look like a genuine photograph of the uploaded individuals captured from the exact camera position and exact body pose shown in the reference scene. The result must not look like a face swap. It must look as if the uploaded individuals themselves originally performed this exact action scene and were photographed in this exact position.
+
+Ultra photorealistic, premium DSLR photography, realistic skin pores, realistic hair strands, realistic anatomy, natural body proportions, physically correct lighting, seamless identity integration, cinematic action movie still, highly detailed, realistic depth, flawless compositing.
+
+Negative prompt: changed pose, changed head angle, changed face angle, changed gaze direction, changed shoulder angle, changed torso rotation, changed body orientation, changed camera angle, changed framing, changed composition, changed perspective, face morphing, identity mixing, weak likeness, inaccurate facial features, poor identity preservation, bad face swap, distorted face, asymmetrical eyes, crossed eyes, malformed anatomy, extra fingers, fused fingers, missing fingers, duplicated fingers, duplicated limbs, unrealistic body proportions, plastic skin, CGI, 3D render, cartoon, anime, illustration, painting, blurry face, low resolution, artifacts, ghosting, double face, duplicated body parts, watermark, logo, text.`;
+
+// ── All styles. locked: true → use config.prompt. locked: false → use UNIVERSAL_PROMPT. ──
+// provider: "replicate" | "openai"  — controls which API is called for this reference.
+// model: the version/model string passed to the chosen provider.
+const STYLE_CONFIG: Record<string, { provider: "replicate" | "openai"; model: string; locked: boolean; prompt?: string; inputMode?: "single" | "couple" }> = {
+  // ── Zootopia ──
+  "zootopia-1": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: ZOOTOPIA_1 },
+  "zootopia-2": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: ZOOTOPIA_2 },
+  "zootopia-3": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: ZOOTOPIA_3 },
+  // ── Tangled ──
+  "tangled-1": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: TANGLED_1 },
+  "tangled-2": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: TANGLED_2 },
+  "tangled-3": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: TANGLED_3 },
+  // ── Cinderella ──
+  "cinderella-1": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: CINDERELLA_1 },
+  "cinderella-2": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: CINDERELLA_2 },
+  "cinderella-3": { provider: "replicate", model: REPLICATE_DEFAULT_MODEL, locked: true, prompt: CINDERELLA_3 },
+  // ── Euphoria ──
+  "euphoria-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: EUPHORIA_1 },
+  "euphoria-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: EUPHORIA_2 },
+  "euphoria-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: EUPHORIA_3 },
+  // ── Titanic ──
+  "titanic-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TITANIC_1 },
+  "titanic-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TITANIC_2 },
+  "titanic-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TITANIC_3 },
+
+  // ── American Psycho ──
+  "americanpsycho-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: AMERICANPSYCHO_1, inputMode: "single" },
+  "americanpsycho-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: AMERICANPSYCHO_2, inputMode: "single" },
+  "americanpsycho-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: AMERICANPSYCHO_3, inputMode: "single" },
+  // ── Fight Club ──
+  "fightclub-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: FIGHTCLUB_1, inputMode: "single" },
+  "fightclub-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: FIGHTCLUB_2, inputMode: "single" },
+  "fightclub-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: FIGHTCLUB_3, inputMode: "single" },
+  // ── Terminator ──
+  "terminator-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TERMINATOR_1, inputMode: "single" },
+  "terminator-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TERMINATOR_2, inputMode: "single" },
+  "terminator-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TERMINATOR_3, inputMode: "single" },
+  // ── The Fast and the Furious ──
+  "thefast-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: THEFAST_1, inputMode: "single" },
+  "thefast-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: THEFAST_2, inputMode: "single" },
+  "thefast-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: THEFAST_3, inputMode: "single" },
+  // ── Mamma Mia! ──
+  "mammamia-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: MAMMAMIA_1, inputMode: "single" },
+  "mammamia-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: MAMMAMIA_2, inputMode: "single" },
+  "mammamia-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: MAMMAMIA_3, inputMode: "single" },
+  // ── Rambo ──
+  "rambo-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: RAMBO_1, inputMode: "single" },
+  "rambo-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: RAMBO_2, inputMode: "single" },
+  "rambo-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: RAMBO_3, inputMode: "single" },
+  // ── Stranger Things ──
+  "stranger-things-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: STRANGER_1 },
+  "stranger-things-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: STRANGER_2 },
+  "stranger-things-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: STRANGER_3 },
+  // ── The End of the F***ing World ──
+  "end-of-the-fucking-world-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: WORLD_1 },
+  "end-of-the-fucking-world-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: WORLD_2 },
+  "end-of-the-fucking-world-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: WORLD_3 },
+  // ── Lalaland ──
+  "lalaland-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: LALALAND_1 },
+  "lalaland-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: LALALAND_2 },
+  "lalaland-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: LALALAND_3 },
+  // ── Collages ──
+  "collage-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_1 },
+  "collage-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_2 },
+  "collage-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_3 },
+  "collage-4": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_4 },
+  "collage-5": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_5 },
+  "collage-6": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_6 },
+  "collage-7": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_7 },
+  "collage-8": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_8 },
+  "collage-9": { provider: "openai", model: "gpt-image-2", locked: true, prompt: COLLAGE_9 },
+  // ── Mr. & Mrs. Smith ──
+  "smith-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: SMITH_1 },
+  "smith-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: SMITH_2 },
+  "smith-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: SMITH_3 },
+  // ── The Notebook ──
+  "thenotebook-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: THENOTEBOOK_1 },
+  "thenotebook-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: THENOTEBOOK_2 },
+  "thenotebook-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: THENOTEBOOK_3 },
+  // ── 500 Days of Summer ──
+  "500daysofsummer-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: SUMMER500_1 },
+  "500daysofsummer-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: SUMMER500_2 },
+  "500daysofsummer-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: SUMMER500_3 },
+  // ── Twilight ──
+  "twilight-1": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TWILIGHT_1 },
+  "twilight-2": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TWILIGHT_2 },
+  "twilight-3": { provider: "openai", model: "gpt-image-2", locked: true, prompt: TWILIGHT_3 },
+};
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(i, i + chunkSize)
+    );
+  }
+
+  return btoa(binary);
+}
+
+async function fileToDataUrl(file: File): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+
+  const b64 = uint8ToBase64(bytes);
+
+  // Use the real MIME type as-is. We do NOT remap HEIC→JPEG here because
+  // changing the MIME header without converting the binary data causes silent
+  // corruption. Provider-specific validation (e.g. OpenAI HEIC rejection) is
+  // handled in each provider branch, not here.
+  const mime = file.type && file.type.startsWith("image/") ? file.type : "image/jpeg";
+
+  console.log(`[FILE] name=${file.name} size=${file.size} mime=${file.type} b64len=${b64.length}`);
+  return `data:${mime};base64,${b64}`;
+}
+
+// OpenAI only: HEIC/HEIF images cannot be server-converted in Deno without a
+// native codec, and fake MIME remapping causes silent binary corruption. We
+// reject them early with a clear user-facing message so the frontend can
+// prompt the user to re-shoot or convert before uploading.
+const HEIC_MIMES = new Set([
+  "image/heic",
+  "image/heif",
+  "image/heic-sequence",
+  "image/heif-sequence",
+]);
+
+// OpenAI /v1/images/edits accepts only these formats.
+const OPENAI_ALLOWED_MIMES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+]);
+
+
+
+function detectImageMime(bytes: Uint8Array): string {
+  if (
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8
+  ) {
+    return "image/jpeg";
+  }
+
+  if (
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return "image/png";
+  }
+
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46
+  ) {
+    return "image/webp";
+  }
+
+  return "image/png";
+}
+
+function validateOpenAIImages(images: string[]): void {
+  for (let i = 0; i < images.length; i++) {
+    const dataUrl = images[i];
+    const mime = dataUrl.startsWith("data:") ? dataUrl.substring(5, dataUrl.indexOf(";")) : "";
+
+    if (HEIC_MIMES.has(mime)) {
+      throw new Error(
+        `Image ${i + 1} is in HEIC/HEIF format, which is not supported by OpenAI. ` +
+        `Please convert your photo to JPEG or PNG before uploading. ` +
+        `On iPhone, you can enable "Most Compatible" format in Settings → Camera → Formats.`
+      );
+    }
+
+    if (mime && !OPENAI_ALLOWED_MIMES.has(mime)) {
+      throw new Error(
+        `Image ${i + 1} has unsupported format "${mime}". ` +
+        `OpenAI requires JPEG, PNG, or WebP images.`
+      );
+    }
+  }
+}
+
+const IMAGE_SIZE_LIMIT_BYTES = 6 * 1024 * 1024; // 6MB hard limit
+
+function base64ByteSize(dataUrl: string): number {
+  const commaIdx = dataUrl.indexOf(",");
+  const b64 = commaIdx >= 0 ? dataUrl.length - commaIdx - 1 : dataUrl.length;
+  return Math.floor(b64 * 3 / 4);
+}
+
+function extractOutputUrl(output: unknown): string | undefined {
+  if (typeof output === "string") {
+    return output;
+  }
+
+  if (Array.isArray(output)) {
+    const first = output[0];
+
+    if (typeof first === "string") {
+      return first;
+    }
+  }
+
+  if (output && typeof output === "object") {
+    const obj = output as Record<string, unknown>;
+
+    const direct =
+      obj.url ??
+      obj.image ??
+      obj.output ??
+      obj.uri;
+
+    if (typeof direct === "string") {
+      return direct;
+    }
+
+    const nestedArrays = [
+      obj.images,
+      obj.data,
+      obj.outputs,
+    ];
+
+    for (const arr of nestedArrays) {
+      if (
+        Array.isArray(arr) &&
+        typeof arr[0] === "string"
+      ) {
+        return arr[0];
+      }
+    }
+  }
+
+  return undefined;
+}
+
+const MIN_IMAGE_BYTES = 5_000;
+
+async function proxyImage(proxyUrl: string): Promise<Response> {
+  const ALLOWED_PROXY_HOSTS = [
+    "https://replicate.delivery/",
+    "https://oaidalleapiprodscus.blob.core.windows.net/",
+  ];
+
+  if (!ALLOWED_PROXY_HOSTS.some((host) => proxyUrl.startsWith(host))) {
+    return new Response(JSON.stringify({ error: "Invalid proxy target" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  const MAX_ATTEMPTS = 2;
+  let lastErr: Error = new Error("Unknown proxy error");
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const abort = new AbortController();
+      const timeout = setTimeout(() => abort.abort(), 90_000);
+
+      let upstream: Response;
+      try {
+        upstream = await fetch(proxyUrl, { signal: abort.signal, headers: { "Accept": "image/*" } });
+      } catch (fetchErr) {
+        clearTimeout(timeout);
+        throw fetchErr;
+      }
+
+      console.log(`[PROXY] status=${upstream.status} content-type=${upstream.headers.get("content-type")} (attempt ${attempt})`);
+
+      if (upstream.status === 403) {
+        clearTimeout(timeout);
+        return new Response(JSON.stringify({ error: "Signed URL expired (403)" }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      if (!upstream.ok) {
+        clearTimeout(timeout);
+        throw new Error(`Upstream error ${upstream.status}`);
+      }
+
+      const contentType = upstream.headers.get("content-type") || "";
+      if (!contentType.startsWith("image/")) {
+        clearTimeout(timeout);
+        return new Response(JSON.stringify({ error: `Invalid content type: ${contentType}` }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const buffer = await upstream.arrayBuffer();
+      clearTimeout(timeout);
+
+      console.log(`[PROXY] SIZE: ${buffer.byteLength} bytes`);
+
+      if (buffer.byteLength < MIN_IMAGE_BYTES) {
+        return new Response(JSON.stringify({ error: `Image too small / corrupted: ${buffer.byteLength} bytes` }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      return new Response(buffer, {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": contentType,
+          "Content-Length": String(buffer.byteLength),
+          "Cache-Control": "public, max-age=86400",
+        },
+      });
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      console.error(`[PROXY] attempt ${attempt} error:`, lastErr.message);
+    }
+  }
+
+  return new Response(JSON.stringify({ error: lastErr.message }), {
+    status: 502,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+// ── Shared helper: upload image bytes to Supabase Storage, return public URL ──
+async function uploadToStorage(imageBytes: Uint8Array, mimeType: string): Promise<string> {
+  const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+  const fileName = `generated/${crypto.randomUUID()}.${ext}`;
+  const MAX_ATTEMPTS = 3;
+  let lastErr: Error = new Error("Storage upload failed");
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    console.log("[STORAGE UPLOAD START] attempt=" + attempt + "/" + MAX_ATTEMPTS +
+      " fileName=" + fileName + " mime=" + mimeType + " bytes=" + imageBytes.byteLength);
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from("generated-images")
+        .upload(fileName, imageBytes, {
+          contentType: mimeType,
+          cacheControl: "3600",
+          upsert: false,
+        });
+
+      if (uploadError) {
+        const sc = (uploadError as { statusCode?: string | number }).statusCode;
+        lastErr = new Error(`Storage upload failed (${sc ?? "unknown"}): ${uploadError.message}`);
+        console.error("[STORAGE UPLOAD ERROR] attempt=" + attempt + "/" + MAX_ATTEMPTS +
+          " statusCode=" + sc + " message=" + uploadError.message);
+        if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
+        continue;
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from("generated-images")
+        .getPublicUrl(fileName);
+
+      const url = publicUrlData.publicUrl;
+      console.log("[STORAGE UPLOAD SUCCESS] attempt=" + attempt +
+        " url=" + url.substring(0, 100) + " bytes=" + imageBytes.byteLength);
+      return url;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      console.error("[STORAGE UPLOAD EXCEPTION] attempt=" + attempt + "/" + MAX_ATTEMPTS +
+        " error=" + lastErr.message);
+      if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
+    }
+  }
+  throw lastErr;
+}
+
+// ── OpenAI generation: called inside waitUntil so it runs after response is sent ──
+async function runOpenAIJob(
+  jobId: string,
+  images: string[],
+  finalPrompt: string,
+  model: string,
+  referenceId: string,
+): Promise<void> {
+  const markFailed = async (msg: string, details?: Record<string, unknown>) => {
+    const safeMsg = (msg && msg.length > 0) ? msg : "Unknown generation error";
+    console.error("[OPENAI JOB FAILED]", {
+      jobId, referenceId, message: safeMsg, ...(details ?? {}),
+    });
+    const { error: dbErr } = await supabase.from("generation_jobs").update({
+      status: "failed",
+      error: safeMsg,
+    }).eq("id", jobId);
+    if (dbErr) {
+      console.error("[OPENAI JOB] markFailed DB write error jobId=" + jobId +
+        " dbError=" + dbErr.message + " originalMsg=" + safeMsg);
+    }
+  };
+
+  try {
+    const openaiApiKey = Deno.env.get("OPENAI_API_KEY");
+    if (!openaiApiKey) {
+      await markFailed("OPENAI_API_KEY not configured");
+      return;
+    }
+
+    // Mark as processing
+    await supabase.from("generation_jobs").update({ status: "processing" }).eq("id", jobId);
+
+    console.log("[OPENAI JOB] building multipart request, images:", images.length, "jobId:", jobId, "referenceId:", referenceId);
+
+    const openaiForm = new FormData();
+    openaiForm.append("model", model);
+    openaiForm.append("prompt", finalPrompt);
+    openaiForm.append("n", "1");
+    openaiForm.append("size", "1024x1024");
+    openaiForm.append("quality", "medium");
+    openaiForm.append("output_format", "jpeg");
+    openaiForm.append("output_compression", "85");
+
+    for (let i = 0; i < images.length; i++) {
+      const dataUrl = images[i];
+      const commaIdx = dataUrl.indexOf(",");
+      const meta = dataUrl.substring(5, dataUrl.indexOf(";"));
+      const b64str = dataUrl.substring(commaIdx + 1);
+      const binaryStr = atob(b64str);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let j = 0; j < binaryStr.length; j++) {
+        bytes[j] = binaryStr.charCodeAt(j);
+      }
+      const ext = meta.split("/")[1] ?? "jpg";
+      openaiForm.append("image[]", new Blob([bytes], { type: meta }), `image_${i}.${ext}`);
+    }
+
+    const openaiAbort = new AbortController();
+    const openaiTimeout = setTimeout(() => openaiAbort.abort(), 5 * 60 * 1000); // 5-min hard timeout
+    const openaiT0 = Date.now();
+    console.log("[OPENAI REQUEST START] jobId=" + jobId + " referenceId=" + referenceId +
+      " imageCount=" + images.length);
+
+    let openaiRes: Response;
+    try {
+      openaiRes = await fetch("https://api.openai.com/v1/images/edits", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${openaiApiKey}` },
+        body: openaiForm,
+        signal: openaiAbort.signal,
+      });
+    } finally {
+      clearTimeout(openaiTimeout);
+    }
+
+    const openaiElapsed = Date.now() - openaiT0;
+    const openaiContentType = openaiRes.headers.get("content-type") ?? "";
+    console.log("[OPENAI REQUEST END] jobId=" + jobId + " status=" + openaiRes.status +
+      " contentType=" + openaiContentType + " elapsedMs=" + openaiElapsed);
+
+    if (!openaiRes.ok) {
+      let errMsg = `OpenAI image generation failed (${openaiRes.status})`;
+      let errorCategory = "generation_failed";
+      try {
+        const errData = await openaiRes.json() as Record<string, unknown>;
+        console.log("[OPENAI JOB] error body:", JSON.stringify(errData).substring(0, 400));
+        const errObj = errData?.error as Record<string, unknown> | undefined;
+        const errCode = String(errObj?.code ?? "").toLowerCase();
+        const errType = String(errObj?.type ?? "").toLowerCase();
+        const errMessage = String(errObj?.message ?? "").toLowerCase();
+
+        // Detect moderation/safety blocks and store a reliably detectable prefix
+        if (
+          errCode === "moderation_blocked" ||
+          errCode === "content_policy_violation" ||
+          errCode.includes("moderation") ||
+          errMessage.includes("safety system") ||
+          errMessage.includes("rejected by the safety") ||
+          errMessage.includes("moderation") ||
+          (errType === "image_generation_user_error" &&
+            (errMessage.includes("safety") || errMessage.includes("moderation") || errMessage.includes("rejected")))
+        ) {
+          errorCategory = "moderation";
+          errMsg = `moderation_blocked: ${errObj?.message ?? "The request was rejected by the safety system."}`;
+        } else {
+          errMsg += ": " + (errData?.error ? JSON.stringify(errData.error) : JSON.stringify(errData).substring(0, 300));
+        }
+      } catch {
+        errMsg += ": (non-JSON error body)";
+      }
+      console.log("[OPENAI JOB ERROR CATEGORY] jobId=" + jobId +
+        " category=" + errorCategory + " httpStatus=" + openaiRes.status);
+      await markFailed(errMsg, { errorCategory, httpStatus: openaiRes.status });
+      return;
+    }
+
+    const openaiData = await openaiRes.json() as Record<string, unknown>;
+    console.log("[OPENAI JOB] response keys:", Object.keys(openaiData).join(", "));
+
+    const dataArr = openaiData.data as Array<Record<string, unknown>> | undefined;
+    const first = dataArr?.[0];
+    const outputUrl = first?.url as string | undefined;
+    const b64json = first?.b64_json as string | undefined;
+
+    let stableUrl: string;
+
+    if (outputUrl) {
+      // Temporary OpenAI/Azure URL — fetch binary with retries then upload to stable storage
+      const IMG_FETCH_ATTEMPTS = 3;
+      let imgBytes: Uint8Array | null = null;
+      let imgContentType = "image/jpeg";
+      let lastFetchErr: Error = new Error("Failed to fetch output image");
+
+      for (let attempt = 1; attempt <= IMG_FETCH_ATTEMPTS; attempt++) {
+        console.log("[OPENAI IMAGE DOWNLOAD START] jobId=" + jobId +
+          " attempt=" + attempt + "/" + IMG_FETCH_ATTEMPTS +
+          " url=" + outputUrl.substring(0, 80));
+        try {
+          const imgFetch = await fetch(outputUrl, { headers: { "Accept": "image/*" } });
+          console.log("[OPENAI IMAGE DOWNLOAD] jobId=" + jobId +
+            " attempt=" + attempt + " status=" + imgFetch.status +
+            " contentType=" + (imgFetch.headers.get("content-type") ?? ""));
+
+          if (!imgFetch.ok) {
+            const retryable = [429, 500, 502, 503, 504].includes(imgFetch.status);
+            lastFetchErr = new Error(`Failed to fetch OpenAI output image (HTTP ${imgFetch.status})`);
+            console.warn("[OPENAI IMAGE DOWNLOAD] jobId=" + jobId +
+              " attempt=" + attempt + " status=" + imgFetch.status +
+              " retryable=" + retryable);
+            if (!retryable || attempt === IMG_FETCH_ATTEMPTS) {
+              await markFailed(lastFetchErr.message, {
+                attempt, httpStatus: imgFetch.status, url: outputUrl.substring(0, 80),
+              });
+              return;
+            }
+            await new Promise(r => setTimeout(r, attempt * 2000));
+            continue;
+          }
+
+          imgContentType = (imgFetch.headers.get("content-type") ?? "image/jpeg").split(";")[0].trim();
+          imgBytes = new Uint8Array(await imgFetch.arrayBuffer());
+          console.log("[OPENAI IMAGE DOWNLOAD SUCCESS] jobId=" + jobId +
+            " attempt=" + attempt + " bytes=" + imgBytes.byteLength +
+            " contentType=" + imgContentType);
+          break;
+        } catch (fetchErr) {
+          lastFetchErr = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
+          console.warn("[OPENAI IMAGE DOWNLOAD EXCEPTION] jobId=" + jobId +
+            " attempt=" + attempt + " error=" + lastFetchErr.message);
+          if (attempt < IMG_FETCH_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 2000));
+        }
+      }
+
+      if (!imgBytes) {
+        await markFailed(
+          `Failed to fetch OpenAI output image after ${IMG_FETCH_ATTEMPTS} attempts: ${lastFetchErr.message}`,
+          { url: outputUrl.substring(0, 80) },
+        );
+        return;
+      }
+
+      stableUrl = await uploadToStorage(imgBytes, imgContentType);
+    } else if (b64json) {
+      console.log("[OPENAI JOB b64] jobId=" + jobId + " decoding b64_json length=" + b64json.length);
+      let bytes: Uint8Array;
+      try {
+        const binaryStr = atob(b64json);
+        bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+      } catch (decodeErr) {
+        const msg = decodeErr instanceof Error ? decodeErr.message : String(decodeErr);
+        await markFailed(`Failed to decode b64_json image data: ${msg}`, { b64Len: b64json.length });
+        return;
+      }
+      console.log("[OPENAI JOB b64] jobId=" + jobId + " decoded bytes=" + bytes.byteLength);
+      stableUrl = await uploadToStorage(bytes, "image/jpeg");
+    } else {
+      await markFailed(`OpenAI response missing output image: ${JSON.stringify(openaiData).substring(0, 200)}`);
+      return;
+    }
+
+    console.log("[OPENAI JOB SUCCESS] jobId=" + jobId + " referenceId=" + referenceId +
+      " stableUrl=" + stableUrl.substring(0, 100));
+    const { error: updateErr } = await supabase.from("generation_jobs").update({
+      status: "succeeded",
+      output: stableUrl,
+    }).eq("id", jobId);
+
+    if (updateErr) {
+      console.error("[OPENAI JOB] succeeded DB update failed jobId=" + jobId +
+        " error=" + updateErr.message + " stableUrl=" + stableUrl.substring(0, 100) +
+        " — retrying once");
+      const { error: retryErr } = await supabase.from("generation_jobs").update({
+        status: "succeeded",
+        output: stableUrl,
+      }).eq("id", jobId);
+      if (retryErr) {
+        console.error("[OPENAI JOB] succeeded DB retry also failed jobId=" + jobId +
+          " error=" + retryErr.message + " IMAGE IS STORED AT: " + stableUrl.substring(0, 100));
+      }
+    }
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? (err.stack ?? "").substring(0, 600) : "";
+    console.error("[OPENAI JOB EXCEPTION] jobId=" + jobId + " referenceId=" + referenceId +
+      " error=" + msg + (stack ? " stack=" + stack : ""));
+    await markFailed(msg || "Unexpected error during generation", { stack: stack.substring(0, 200) });
+  }
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders });
+  }
+
+  const reqUrl = new URL(req.url);
+
+  // ── GET ?jobId=  — poll an async OpenAI job from generation_jobs table ──
+  if (req.method === "GET" && reqUrl.searchParams.has("jobId")) {
+    const jobId = reqUrl.searchParams.get("jobId")!;
+    console.log("[JOB POLL] jobId:", jobId);
+
+    try {
+      const { data: job, error: dbErr } = await supabase
+        .from("generation_jobs")
+        .select("status, output, error")
+        .eq("id", jobId)
+        .maybeSingle();
+
+      if (dbErr) {
+        console.error("[JOB POLL] db error:", dbErr.message);
+        return jsonResponse({ provider: "openai", status: "processing" });
+      }
+      if (!job) {
+        return jsonResponse({ provider: "openai", status: "failed", error: "Job not found" });
+      }
+
+      console.log("[JOB POLL] status:", job.status, "output:", String(job.output ?? "").substring(0, 80));
+
+      if (job.status === "succeeded") {
+        return jsonResponse({ provider: "openai", status: "succeeded", output: job.output, functionVersion: FUNCTION_VERSION });
+      }
+      if (job.status === "failed") {
+        return jsonResponse({ provider: "openai", status: "failed", error: job.error ?? "Unknown error" });
+      }
+      // pending or processing
+      return jsonResponse({ provider: "openai", status: "processing" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[JOB POLL ERROR]", msg);
+      return jsonResponse({ provider: "openai", status: "processing" });
+    }
+  }
+
+  // ── GET ?id=  — poll a Replicate prediction ──
+  if (req.method === "GET" && reqUrl.searchParams.has("id")) {
+    const predictionId = reqUrl.searchParams.get("id")!;
+    const replicateApiKey = Deno.env.get("REPLICATE_API_KEY");
+    if (!replicateApiKey) {
+      return jsonResponse({ provider: "replicate", status: "failed", error: "REPLICATE_API_KEY not configured" });
+    }
+
+    try {
+      const res = await fetch(`https://api.replicate.com/v1/predictions/${predictionId}`, {
+        headers: { "Authorization": `Bearer ${replicateApiKey}` },
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        console.error("[REPLICATE POLL] error status:", res.status, text.substring(0, 200));
+        return jsonResponse({ provider: "replicate", status: "processing" });
+      }
+
+      const prediction = await res.json() as Record<string, unknown>;
+      const status = prediction.status as string;
+      console.log("[REPLICATE POLL] id:", predictionId, "status:", status);
+
+      if (status === "succeeded") {
+        const outputUrl = extractOutputUrl(prediction.output);
+        console.log("[REPLICATE POLL] outputUrl:", outputUrl?.substring(0, 100) ?? "(none)");
+        if (!outputUrl) {
+          return jsonResponse({ provider: "replicate", status: "failed", error: "Output URL could not be extracted" });
+        }
+        return jsonResponse({ provider: "replicate", status: "succeeded", output: outputUrl, functionVersion: FUNCTION_VERSION });
+      }
+
+      if (status === "failed" || status === "canceled") {
+        const errDetail = JSON.stringify(prediction.error ?? prediction.logs ?? status);
+        console.error("[REPLICATE POLL] prediction", status, errDetail);
+        return jsonResponse({ provider: "replicate", status: "failed", error: errDetail });
+      }
+
+      return jsonResponse({ provider: "replicate", status: "processing" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[REPLICATE POLL ERROR]", msg);
+      return jsonResponse({ provider: "replicate", status: "processing" });
+    }
+  }
+
+  // ── POST /generate ── validate, route to provider, return job/prediction ID immediately ──
+  if (req.method === "POST") {
+    try {
+      // ── Parse request: JSON (preferred, new path) or multipart (legacy fallback) ──
+      const contentType = req.headers.get("content-type") ?? "";
+      const isJson = contentType.includes("application/json");
+
+      type ImageSlots = {
+        person1: string;      // data URL
+        person2?: string;     // optional for single-person styles
+        person1b?: string;
+        person2b?: string;
+        reference: string;
+        referenceId: string;
+        mode?: string;
+      };
+
+      let slots: ImageSlots;
+
+      if (isJson) {
+        // ── JSON path: frontend uploaded images to Storage and sent us signed URLs ──
+        const body = await req.json() as {
+          referenceId?: string;
+          style?: string;
+          mode?: string;
+          images?: Record<string, string>;
+        };
+
+        if (!body.referenceId) {
+          return jsonResponse({ error: "Missing referenceId" } as unknown as GenerateResponse, 400);
+        }
+
+        const earlyConfig = STYLE_CONFIG[body.referenceId];
+        const isSingleInput = earlyConfig?.inputMode === "single";
+
+        if (!body.images?.person1 || (!isSingleInput && !body.images?.person2) || !body.images?.reference) {
+          return jsonResponse({ error: `Missing required image URLs (person1${isSingleInput ? "" : ", person2"}, reference)` } as unknown as GenerateResponse, 400);
+        }
+
+        console.log("[POST] JSON path, fetching images from storage", { referenceId: body.referenceId, keys: Object.keys(body.images), isSingleInput });
+
+        // Download each image URL and convert to data URL
+        const urlToDataUrl = async (url: string, label: string): Promise<string> => {
+          const MAX_FETCH_ATTEMPTS = 2;
+          let lastErr: Error = new Error("Unknown");
+          for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+            try {
+              const res = await fetch(url, { headers: { Accept: "image/*" } });
+              if (!res.ok) throw new Error(`Fetch ${label} failed: HTTP ${res.status}`);
+              const buf = await res.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              const inferredMime = detectImageMime(bytes);
+              const ctHeader = (res.headers.get("content-type") ?? "").split(";")[0].trim();
+              const mime = (ctHeader.startsWith("image/") ? ctHeader : inferredMime);
+              const b64 = uint8ToBase64(bytes);
+              console.log(`[FETCH_IMAGE] ${label} mime=${mime} bytes=${bytes.length}`);
+              return `data:${mime};base64,${b64}`;
+            } catch (err) {
+              lastErr = err instanceof Error ? err : new Error(String(err));
+              console.warn(`[FETCH_IMAGE] ${label} attempt ${attempt} failed: ${lastErr.message}`);
+              if (attempt < MAX_FETCH_ATTEMPTS) await new Promise(r => setTimeout(r, 1000));
+            }
+          }
+          throw lastErr;
+        };
+
+        const [p1, p2, ref, p1b, p2b] = await Promise.all([
+          urlToDataUrl(body.images.person1, "person1"),
+          !isSingleInput ? urlToDataUrl(body.images.person2!, "person2") : Promise.resolve(undefined),
+          urlToDataUrl(body.images.reference, "reference"),
+          body.images.person1b ? urlToDataUrl(body.images.person1b, "person1b") : Promise.resolve(undefined),
+          body.images.person2b ? urlToDataUrl(body.images.person2b, "person2b") : Promise.resolve(undefined),
+        ]);
+
+        slots = {
+          person1: p1, ...(p2 ? { person2: p2 } : {}), reference: ref,
+          ...(p1b ? { person1b: p1b } : {}),
+          ...(p2b ? { person2b: p2b } : {}),
+          referenceId: body.referenceId,
+          ...(body.mode ? { mode: body.mode } : {}),
+        };
+
+      } else {
+        // ── Multipart path: legacy fallback ──
+        const formData = await req.formData();
+
+        const refId = formData.get("referenceId") as string | null;
+        const reference = formData.get("reference") as File | null;
+        const person1 = formData.get("person1") as File | null;
+        const person1b = formData.get("person1b") as File | null;
+        const person2 = formData.get("person2") as File | null;
+        const person2b = formData.get("person2b") as File | null;
+        const mode = formData.get("mode") as string | null;
+
+        if (!reference || reference.size === 0) {
+          return jsonResponse({ error: "Missing or empty reference file" } as unknown as GenerateResponse, 400);
+        }
+        if (!refId) {
+          return jsonResponse({ error: "Missing referenceId" } as unknown as GenerateResponse, 400);
+        }
+        if (!person1 || person1.size === 0) {
+          return jsonResponse({ error: "Missing or empty person1 file" } as unknown as GenerateResponse, 400);
+        }
+
+        const multipartConfig = STYLE_CONFIG[refId];
+        const isMultipartSingle = multipartConfig?.inputMode === "single";
+
+        if (!isMultipartSingle && (!person2 || person2.size === 0)) {
+          return jsonResponse({ error: "Missing or empty person2 file" } as unknown as GenerateResponse, 400);
+        }
+
+        console.log("[POST] multipart path (legacy)", { refId, isMultipartSingle });
+
+        const [p1, p2, ref, p1b, p2b] = await Promise.all([
+          fileToDataUrl(person1),
+          !isMultipartSingle && person2 ? fileToDataUrl(person2) : Promise.resolve(undefined),
+          fileToDataUrl(reference),
+          person1b && person1b.size > 0 ? fileToDataUrl(person1b) : Promise.resolve(undefined),
+          person2b && person2b.size > 0 ? fileToDataUrl(person2b) : Promise.resolve(undefined),
+        ]);
+
+        slots = {
+          person1: p1, ...(p2 ? { person2: p2 } : {}), reference: ref,
+          ...(p1b ? { person1b: p1b } : {}),
+          ...(p2b ? { person2b: p2b } : {}),
+          referenceId: refId,
+          ...(mode ? { mode } : {}),
+        };
+      }
+
+      // ── Shared provider dispatch (identical for both paths) ──────────────────
+
+      const { referenceId, person1b: slotP1b, person2b: slotP2b } = slots;
+
+      const config = STYLE_CONFIG[referenceId];
+      if (!config) {
+        return jsonResponse({ error: `Unknown referenceId: ${referenceId}` } as unknown as GenerateResponse, 400);
+      }
+
+      console.log("[VERSION]", FUNCTION_VERSION);
+      console.log("[PROVIDER]", config.provider);
+      console.log("[MODEL]", config.model);
+      console.log("[REFERENCE_ID]", referenceId);
+
+      const isSingle = config.inputMode === "single";
+
+      let roleMappingBlock: string;
+      let images: string[];
+
+      if (isSingle) {
+        roleMappingBlock = `IMAGE ROLE MAPPING (2 images total):
+- image_input[0] = base scene (pose, expression, lighting, composition source)
+- image_input[1] = identity source
+
+The person in the scene must look like the person in image_input[1].
+Do NOT use image_input[0] as an identity source.`;
+        images = [slots.reference, slots.person1];
+      } else {
+        const hasMan2 = !!slotP1b;
+        const hasWoman2 = !!slotP2b;
+
+        const manCount = hasMan2 ? 2 : 1;
+        const womanCount = hasWoman2 ? 2 : 1;
+        const idxScene = 0;
+        const idxManStart = 1;
+        const idxManEnd = idxManStart + manCount - 1;
+        const idxWomanStart = idxManEnd + 1;
+        const totalImages = 1 + manCount + womanCount;
+
+        const manIdxList = manCount === 1
+          ? `image_input[${idxManStart}]`
+          : `image_input[${idxManStart}] and image_input[${idxManEnd}]`;
+        const womanIdxList = womanCount === 1
+          ? `image_input[${idxWomanStart}]`
+          : `image_input[${idxWomanStart}] and image_input[${idxWomanStart + womanCount - 1}]`;
+
+        roleMappingBlock = `IMAGE ROLE MAPPING (${totalImages} images total):
+- image_input[${idxScene}] = base scene (pose, expression, lighting, composition source)
+- ${manIdxList} = MAN identity source${manCount > 1 ? " (same person, merge into one identity)" : ""}
+- ${womanIdxList} = WOMAN identity source${womanCount > 1 ? " (same person, merge into one identity)" : ""}
+
+The man in the scene must look like the person in ${manIdxList}.
+The woman in the scene must look like the person in ${womanIdxList}.
+Do NOT mix man and woman identity sources.
+Do NOT use image_input[${idxScene}] as an identity source.`;
+
+        const personDataUrls = [
+          slots.person1,
+          ...(hasMan2 ? [slotP1b!] : []),
+          slots.person2!,
+          ...(hasWoman2 ? [slotP2b!] : []),
+        ];
+        images = [slots.reference, ...personDataUrls];
+
+        if (images.length !== totalImages) {
+          throw new Error(`Image count mismatch: expected ${totalImages}, got ${images.length}`);
+        }
+      }
+
+      const finalPrompt = config.locked
+        ? roleMappingBlock + "\n\n" + config.prompt
+        : roleMappingBlock + "\n\n" + UNIVERSAL_PROMPT;
+
+      // Per-image size guard
+      for (let i = 0; i < images.length; i++) {
+        const rawBytes = base64ByteSize(images[i]);
+        if (rawBytes > IMAGE_SIZE_LIMIT_BYTES) {
+          throw new Error(
+            `Image ${i} is ${(rawBytes / 1024 / 1024).toFixed(2)}MB — exceeds the 6MB per-image limit.`
+          );
+        }
+      }
+
+      const imageSummary = images.map((img, i) => ({
+        index: i,
+        mime: img.startsWith("data:") ? img.substring(5, img.indexOf(";")) : "unknown",
+        bytes: base64ByteSize(img),
+      }));
+      console.log("[INPUT_IMAGES]", images.length, JSON.stringify(imageSummary));
+      console.log("[TOTAL_MB]", (imageSummary.reduce((s, x) => s + x.bytes, 0) / 1024 / 1024).toFixed(2));
+
+      // ── REPLICATE ──
+      if (config.provider === "replicate") {
+        const replicateApiKey = Deno.env.get("REPLICATE_API_KEY");
+        if (!replicateApiKey) throw new Error("REPLICATE_API_KEY not configured");
+
+        const createRes = await fetch("https://api.replicate.com/v1/predictions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${replicateApiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            version: config.model,
+            input: { prompt: finalPrompt, image_input: images },
+          }),
+        });
+
+        const createText = await createRes.text();
+        console.log("[REPLICATE CREATE] status:", createRes.status, "body:", createText.substring(0, 300));
+
+        if (!createRes.ok) {
+          throw new Error(`Replicate prediction creation failed (${createRes.status}): ${createText.substring(0, 400)}`);
+        }
+
+        let prediction: Record<string, unknown>;
+        try {
+          prediction = JSON.parse(createText);
+        } catch {
+          throw new Error(`Replicate create response non-JSON: ${createText.substring(0, 300)}`);
+        }
+
+        const predictionId = prediction.id as string | undefined;
+        if (!predictionId) {
+          throw new Error(`Replicate prediction has no ID: ${JSON.stringify(prediction).substring(0, 300)}`);
+        }
+
+        console.log("[REPLICATE CREATE] prediction started id=" + predictionId);
+
+        return jsonResponse({
+          provider: "replicate",
+          status: "processing",
+          predictionId,
+          model: config.model,
+          referenceId,
+          functionVersion: FUNCTION_VERSION,
+        }, 201);
+      }
+
+      // ── OPENAI (async via waitUntil) ──
+      if (config.provider === "openai") {
+        validateOpenAIImages(images);
+
+        const { data: jobRow, error: insertErr } = await supabase
+          .from("generation_jobs")
+          .insert({ provider: "openai", status: "pending" })
+          .select("id")
+          .single();
+
+        if (insertErr || !jobRow) {
+          throw new Error(`Failed to create generation job: ${insertErr?.message ?? "no row returned"}`);
+        }
+
+        const jobId = jobRow.id as string;
+        console.log("[OPENAI] job created jobId:", jobId, "referenceId:", referenceId);
+
+        EdgeRuntime.waitUntil(
+          runOpenAIJob(jobId, images, finalPrompt, config.model, referenceId)
+        );
+
+        return jsonResponse({
+          provider: "openai",
+          status: "processing",
+          predictionId: jobId,
+          model: config.model,
+          referenceId,
+          functionVersion: FUNCTION_VERSION,
+        }, 201);
+      }
+
+      throw new Error(`Unknown provider: ${(config as { provider: string }).provider}`);
+
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[POST ERROR]", msg);
+      return jsonResponse({ error: msg } as unknown as GenerateResponse, 500);
+    }
+  }
+
+  return jsonResponse({ error: "Method not allowed" } as unknown as GenerateResponse, 405);
+});
