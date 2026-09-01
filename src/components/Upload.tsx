@@ -55,14 +55,24 @@ export default function Upload({
     (async () => {
       try {
         const response = await fetch(selectedRef.image);
+        if (!response.ok) {
+          throw new Error(`Failed to load reference image: HTTP ${response.status}`);
+        }
+        const ct = response.headers.get('content-type') ?? '';
+        if (!ct.startsWith('image/')) {
+          throw new Error(`Reference image has invalid content-type "${ct}" — expected an image`);
+        }
         const blob = await response.blob();
-        const rawFile = new File([blob], 'reference.jpg', { type: blob.type || 'image/jpeg' });
+        if (!blob.type.startsWith('image/')) {
+          throw new Error(`Reference blob has invalid type "${blob.type}" — expected an image`);
+        }
+        const rawFile = new File([blob], 'reference.jpg', { type: blob.type });
         const { file: resizedRef } = await resizeImage(rawFile, 1024, 0.82);
         console.log(`[UPLOAD] reference ready: size=${resizedRef.size} type=${resizedRef.type}`);
         setReferenceFile(resizedRef);
       } catch (err) {
         console.error('Failed to load reference image:', err);
-        setError('Failed to load reference image');
+        setError(err instanceof Error ? err.message : 'Failed to load reference image');
       }
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
