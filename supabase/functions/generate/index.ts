@@ -1,3 +1,4 @@
+// Edge function: AI image generation (OpenAI + Replicate providers)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
